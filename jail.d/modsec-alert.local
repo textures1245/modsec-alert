@@ -1,0 +1,33 @@
+[DEFAULT]
+discord_webhook = REPLACE_ME_AT_INSTALL_TIME
+
+[modsec-block-alert]
+enabled  = true
+filter   = modsec-block
+# main error_log AND every per-vhost override (confirmed on box-dedicate.one.th:
+# vhost has its own error_log, main /var/log/nginx/error.log never saw the block)
+logpath  = /var/log/nginx/error.log
+           /var/log/nginx/*error*.log
+backend  = auto
+maxretry = 1
+findtime = 60
+# bantime=1 (near-zero) hit a fail2ban internal debounce quirk: confirmed live
+# on box-dedicate.one.th, "Ignore <ip>, expired bantime" fired even 5s after
+# the prior unban -- not simple 1s-window suppression, an edge case bantime
+# this low isn't built for. 30s is a real dedup window: repeat alerts from the
+# same source within it collapse into one, which is correct alerting practice
+# anyway (a scanner hammering one endpoint shouldn't page 10x), and it's long
+# enough to sit outside fail2ban's internal tick/debounce edge case.
+bantime  = 30
+action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
+
+[modsec-warning-spike]
+enabled    = true
+filter     = modsec-warning-spike
+logpath    = /var/log/modsec_audit.log
+backend    = auto
+maxretry   = 200
+findtime   = 300
+bantime    = 30
+ignoreself = false
+action     = discord-alert[level="WARNING-SPIKE", discord_webhook="%(discord_webhook)s"]
