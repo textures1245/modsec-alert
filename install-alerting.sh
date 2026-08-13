@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Fresh-install the fail2ban -> Discord ModSec alerting on THIS box.
+# Install OR repatch the fail2ban -> Discord ModSec alerting on THIS box.
 # Self-contained: no SSH, no remote execution. Copy this one file to the
 # target host (scp/rsync/paste) and run it there directly as root.
 #
-# Usage (on the box, as root):
+# This is the ONLY script -- there is no separate modsec-discord-alert.sh to
+# keep in sync. It's written inline below (search EOF_E) and every artifact
+# this script writes uses `cat > path` (full overwrite, not append), so
+# re-running this exact same command on an already-installed box is a safe
+# repatch: it pushes whatever version of this file you're holding, then
+# restarts fail2ban to pick it up. No separate "patch" script, no manual
+# heredoc-syncing between two files -- edit this file, re-run it, done.
+#
+# Usage (on the box, as root -- same command for first install and repatch):
 #   ./install-alerting.sh '<discord_webhook_url>' '<public_ip>'
 #
 # Prereqs before running this against a real box:
