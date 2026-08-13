@@ -20,6 +20,11 @@ HOST="$(hostname)"
 LOGFILE="/var/log/modsec-discord-alert.log"
 AUDIT_LOG="/var/log/modsec_audit.log"
 PUBLIC_IP_FILE="/etc/modsec-alert-public-ip"
+# If the audit-log entry we found is older than this, the file has likely
+# stopped being appended to (rotation without reopen, wrong SecAuditLog path,
+# etc) -- confirmed failure mode on pueantaecloud/box-dedicate before. Flag it
+# instead of silently reposting stale detail as if it were the current ban.
+STALE_THRESHOLD_SECS=300
 PUBLIC_IP="unknown"
 [ -r "$PUBLIC_IP_FILE" ] && PUBLIC_IP="$(cat "$PUBLIC_IP_FILE")"
 
@@ -51,6 +56,22 @@ if [ "$LEVEL" = "BLOCK" ]; then
     SECTION_A=$(printf '%s\n' "$AB_PAIR" | tail -1)
     TS_EXTRACT=$(printf '%s' "$SECTION_A" | grep -oP '(?<=^\[)[^\]]+')
     [ -n "$TS_EXTRACT" ] && TS="$TS_EXTRACT"
+
+    STALE=0
+    AGE=""
+    if [ -n "$TS_EXTRACT" ]; then
+      BLOCK_EPOCH=$(python3 -c "
+import datetime, sys
+try:
+    print(int(datetime.datetime.strptime(sys.argv[1], '%d/%b/%Y:%H:%M:%S %z').timestamp()))
+except Exception:
+    pass
+" "$TS_EXTRACT" 2>/dev/null)
+      if [ -n "$BLOCK_EPOCH" ]; then
+        AGE=$(( $(date +%s) - BLOCK_EPOCH ))
+        [ "$AGE" -gt "$STALE_THRESHOLD_SECS" ] && STALE=1
+      fi
+    fi
 
     if [ -n "$TAG" ]; then
       # Single pass pulls both Section B (full request line incl. query
@@ -106,9 +127,17 @@ if [ "$LEVEL" = "BLOCK" ]; then
   # $(...) strips trailing newlines, so append \n outside the substitution.
   [ -n "$BODY_RAW" ] && BODY_LINE="$(printf '📦 %sRequest Body%s : %s%s%s' "$CYN" "$RST" "$YEL" "$BODY_RAW" "$RST")"$'\n'
 
+  STALE_BANNER=""
+  if [ "${STALE:-0}" -eq 1 ]; then
+    STALE_BANNER="$(printf '%s⚠️  AUDIT LOG STALE (entry is %ss old)%s' "$RED" "$AGE" "$RST")"$'\n'
+    STALE_BANNER+="$(printf '%sBan on src=%s is real (matched live nginx error.log) -- but the detail below is the LAST entry modsec_audit.log ever wrote, not this ban. modsec_audit.log has likely stopped appending. Check SecAuditEngine/SecAuditLog path + logrotate reopen signal.%s' "$YEL" "$SRC_IP" "$RST")"$'\n'
+    STALE_BANNER+="${GRY}${DIV_DA}${RST}"$'\n'
+  fi
+
   MSG=$(cat <<MSGEOF
 ${RED}🛡️ ModSec BLOCK Alert${RST}
 ${GRY}${DIV_EQ}${RST}
+${STALE_BANNER}
 📅 ${CYN}วันที่/เวลา${RST}  : ${TS}
 🖥️  ${CYN}โฮสต์ (VM)${RST}   : ${HOST}
 🌐 ${CYN}Public IP${RST}    : ${GRN}${PUBLIC_IP}${RST}
@@ -148,8 +177,8 @@ CURL_EXIT=$?
 RESP_BODY=$(head -c 300 "$RESP_FILE" 2>/dev/null)
 rm -f "$RESP_FILE"
 
-printf '%s level=%s jail=%s src=%s curl_exit=%s http=%s resp=%s\n' \
-  "$(date -Is)" "$LEVEL" "$JAIL" "$SRC_IP" "$CURL_EXIT" "${HTTP_CODE:-none}" "${RESP_BODY:-}" >> "$LOGFILE"
+printf '%s level=%s jail=%s src=%s stale=%s age=%s curl_exit=%s http=%s resp=%s\n' \
+  "$(date -Is)" "$LEVEL" "$JAIL" "$SRC_IP" "${STALE:-0}" "${AGE:-NA}" "$CURL_EXIT" "${HTTP_CODE:-none}" "${RESP_BODY:-}" >> "$LOGFILE"
 
 if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "204" ]; then
   exit 1
