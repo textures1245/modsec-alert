@@ -16,10 +16,7 @@
 #
 # Prereqs before running this against a real box:
 #   1. Discord webhook created in the dedicated #modsec-alerts channel (t_1785815110)
-#   2. Root-cause + fix confirmed for THIS host's modsec_audit.log liveness --
-#      pueantaecloud is known stale as of 2026-08-04 -- do NOT run there until
-#      that's resolved, or Jail 2 will just sit silent watching a dead file.
-#   3. Public IP for this box (from the fleet inventory sheet) -- these VMs are
+#   2. Public IP for this box (from the fleet inventory sheet) -- these VMs are
 #      NAT'd, `hostname -I` only ever returns the internal IP, so this can't
 #      be auto-detected on-box and must be supplied.
 set -euo pipefail
@@ -45,16 +42,11 @@ failregex = \[client <HOST>\] ModSecurity: Access denied with code 403 \(phase \
 ignoreregex =
 EOF_A
 
-cat > /etc/fail2ban/filter.d/modsec-warning-spike.conf <<'EOF_B'
-# modsec_audit.log Section H warning lines carry NO client IP (confirmed via
-# precheck-alerting.sh, pueantaecloud sample) -- only [hostname "<server-ip>"],
-# which is the box's own internal IP, constant for every line on this host.
-# Binding <HOST> to it turns this into a global per-box rate counter (no real
-# per-attacker IP available at this layer) rather than a real ban target.
-[Definition]
-failregex = ModSecurity: Warning\..*\[hostname "<HOST>"\]
-ignoreregex =
-EOF_B
+# Repatch cleanup: the modsec-warning-spike jail/filter (rate counter on
+# ModSecurity Warning-level lines) was removed -- too noisy, no per-request
+# detail, mostly just echoed the same filename-FP noise the block alerts
+# already cover. Delete any leftover filter file from a prior install.
+rm -f /etc/fail2ban/filter.d/modsec-warning-spike.conf
 
 cat > /etc/fail2ban/action.d/discord-alert.conf <<'EOF_C'
 # Deliberately does NOT interpolate <matches> (raw, attacker-influenced log
@@ -108,8 +100,7 @@ PUBLIC_IP="unknown"
 # Discord renders ANSI SGR codes inside ```ansi fenced code blocks.
 RED=$'\e[1;31m'; GRN=$'\e[1;32m'; YEL=$'\e[1;33m'; CYN=$'\e[1;36m'; GRY=$'\e[2;37m'; RST=$'\e[0m'
 
-if [ "$LEVEL" = "BLOCK" ]; then
-  LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$AUDIT_LOG" 2>/dev/null | tail -1)
+LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$AUDIT_LOG" 2>/dev/null | tail -1)
   UID_RAW=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[unique_id ")[^"]+' | head -1)
   UID_SAFE=""
   if [[ "$UID_RAW" =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -192,7 +183,7 @@ except Exception:
       fi
     done <<< "$WARNINGS"
   fi
-  [ -z "$RULES_TEXT" ] && RULES_TEXT="(no rule detail found -- check unique_id lookup)"
+[ -z "$RULES_TEXT" ] && RULES_TEXT="(no rule detail found -- check unique_id lookup)"
   DIV_EQ="════════════════════════════════════"
   DIV_DA="────────────────────────────────────"
   INTERNAL_IP=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[hostname ")[^"]+' | head -1)
@@ -230,21 +221,6 @@ ${GRY}${DIV_EQ}${RST}
 ${RULES_TEXT}${GRY}${DIV_EQ}${RST}
 MSGEOF
 )
-else
-  # WARNING-SPIKE: no single transaction to reference, this is a rate alert.
-  DIV_EQ="════════════════════════════════════"
-  MSG=$(cat <<MSGEOF
-${YEL}⚠️ ModSec WARNING-SPIKE Alert${RST}
-${GRY}${DIV_EQ}${RST}
-🖥️  ${CYN}โฮสต์ (VM)${RST}  : ${HOST}
-🔒 ${CYN}Internal IP${RST} : ${YEL}${SRC_IP}${RST}
-📂 ${CYN}Jail${RST}        : ${JAIL}
-${GRY}${DIV_EQ}${RST}
-อัตราการยิง Warning เกิน threshold ในช่วงเวลาที่กำหนด
-ดูรายละเอียดเต็มได้ที่ modsec_audit.log บนโฮสต์นี้
-MSGEOF
-)
-fi
 
 PAYLOAD=$(printf '```ansi\n%s\n```' "$MSG" | python3 -c 'import json,sys; print(json.dumps({"content": sys.stdin.read()}))')
 
@@ -288,17 +264,6 @@ findtime = 60
 # enough to sit outside fail2ban's internal tick/debounce edge case.
 bantime  = 30
 action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
-
-[modsec-warning-spike]
-enabled    = true
-filter     = modsec-warning-spike
-logpath    = /var/log/modsec_audit.log
-backend    = auto
-maxretry   = 200
-findtime   = 300
-bantime    = 30
-ignoreself = false
-action     = discord-alert[level="WARNING-SPIKE", discord_webhook="%(discord_webhook)s"]
 EOF_D
 chmod 640 /etc/fail2ban/jail.d/modsec-alert.local
 
@@ -321,8 +286,6 @@ sleep 1
 fail2ban-client status
 echo "--- jail: modsec-block-alert ---"
 fail2ban-client status modsec-block-alert
-echo "--- jail: modsec-warning-spike ---"
-fail2ban-client status modsec-warning-spike
 echo "public IP baked in: $(cat /etc/modsec-alert-public-ip)"
 echo "INSTALL_OK $(hostname)"
 echo "Next: trigger a real block on this host and confirm the Discord message lands."

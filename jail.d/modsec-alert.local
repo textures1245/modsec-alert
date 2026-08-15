@@ -20,14 +20,3 @@ findtime = 60
 # enough to sit outside fail2ban's internal tick/debounce edge case.
 bantime  = 30
 action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
-
-[modsec-warning-spike]
-enabled    = true
-filter     = modsec-warning-spike
-logpath    = /var/log/modsec_audit.log
-backend    = auto
-maxretry   = 200
-findtime   = 300
-bantime    = 30
-ignoreself = false
-action     = discord-alert[level="WARNING-SPIKE", discord_webhook="%(discord_webhook)s"]
