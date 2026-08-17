@@ -100,7 +100,17 @@ PUBLIC_IP="unknown"
 # Discord renders ANSI SGR codes inside ```ansi fenced code blocks.
 RED=$'\e[1;31m'; GRN=$'\e[1;32m'; YEL=$'\e[1;33m'; CYN=$'\e[1;36m'; GRY=$'\e[2;37m'; RST=$'\e[0m'
 
-LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$AUDIT_LOG" 2>/dev/null | tail -1)
+# Full-file grep/awk against this audit log (unrotated, multi-GB and growing)
+# was taking 40-60s+ under load and getting killed by fail2ban's action
+# timeout before ever reaching the curl call below -- confirmed 2026-08-17 on
+# a 4GB file, a single `grep -c` alone took ~3.75s. The transaction we care
+# about is always the one just appended, so slice a generous recent window
+# once and search that instead of scanning the full file on every lookup.
+TAIL_LOG="$(mktemp)"
+trap 'rm -f "$TAIL_LOG"' EXIT
+tail -c 20000000 "$AUDIT_LOG" > "$TAIL_LOG" 2>/dev/null
+
+LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$TAIL_LOG" 2>/dev/null | tail -1)
   UID_RAW=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[unique_id ")[^"]+' | head -1)
   UID_SAFE=""
   if [[ "$UID_RAW" =~ ^[0-9]+\.[0-9]+$ ]]; then
@@ -119,7 +129,7 @@ LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$AUDIT_LOG" 2>/dev
   if [ -n "$UID_SAFE" ]; then
     # -B1 grabs the "---TAG---A--" marker line together with the Section A
     # content line in one pass, so TAG is available for free alongside TS.
-    AB_PAIR=$(grep -B1 -F -- " ${UID_SAFE} " "$AUDIT_LOG" 2>/dev/null | tail -2)
+    AB_PAIR=$(grep -B1 -F -- " ${UID_SAFE} " "$TAIL_LOG" 2>/dev/null | tail -2)
     TAG=$(printf '%s\n' "$AB_PAIR" | head -1 | grep -oP '(?<=^---)[A-Za-z0-9]+(?=---A--$)')
     SECTION_A=$(printf '%s\n' "$AB_PAIR" | tail -1)
     TS_EXTRACT=$(printf '%s' "$SECTION_A" | grep -oP '(?<=^\[)[^\]]+')
@@ -151,14 +161,14 @@ except Exception:
         /^---/ { sec=""; next }
         sec=="B" && !gotreq && NF { print "REQ:" $0; gotreq=1; next }
         sec=="I" { print "BODY:" $0 }
-      ' "$AUDIT_LOG" 2>/dev/null)
+      ' "$TAIL_LOG" 2>/dev/null)
       REQ_LINE=$(printf '%s\n' "$AWK_OUT" | grep '^REQ:' | sed 's/^REQ://' | head -c 300)
       BODY_RAW=$(printf '%s\n' "$AWK_OUT" | grep '^BODY:' | sed 's/^BODY://' | tr '\n' ' ' | head -c 200)
     fi
 
     DIV="────────────────────────────────────"
     RULE_NUM=0
-    WARNINGS=$(grep -F -- "unique_id \"${UID_SAFE}\"" "$AUDIT_LOG" 2>/dev/null | grep "ModSecurity: Warning")
+    WARNINGS=$(grep -F -- "unique_id \"${UID_SAFE}\"" "$TAIL_LOG" 2>/dev/null | grep "ModSecurity: Warning")
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       RID=$(printf '%s' "$line" | grep -oP '(?<=\[id ")[0-9]+' | head -1)
