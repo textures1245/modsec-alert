@@ -42,6 +42,27 @@ failregex = \[client <HOST>\] ModSecurity: Access denied with code 403 \(phase \
 ignoreregex =
 EOF_A
 
+cat > /etc/fail2ban/filter.d/modsec-detect.conf <<'EOF_B'
+# Detects the CRS "Inbound Anomaly Score Exceeded" summary rule (id 949110)
+# logged as Warning -- this is the DetectionOnly-mode equivalent of the
+# block line in modsec-block.conf: a single per-request summary line, not
+# one of the many individual contributing-rule warnings, so it stays as
+# low-volume as the block alert instead of repeating the noise that got the
+# old modsec-warning-spike jail (rate-counted over EVERY Warning line)
+# removed. In blocking mode this same rule instead produces "Access denied"
+# (matched by modsec-block.conf), never "Warning", so this filter does not
+# double-fire alongside the block jail.
+#
+# UNVERIFIED against a live DetectionOnly box -- no confirmed real sample
+# yet (unlike modsec-block.conf's t_1783925596 sample). Validate the exact
+# line shape with `fail2ban-regex` against a real error.log entry before
+# relying on this in production; CRS's msg text can drift across versions,
+# hence anchoring on the rule id token rather than message wording.
+[Definition]
+failregex = \[client <HOST>\] ModSecurity: Warning\. .*\[id "949110"\]
+ignoreregex =
+EOF_B
+
 # Repatch cleanup: the modsec-warning-spike jail/filter (rate counter on
 # ModSecurity Warning-level lines) was removed -- too noisy, no per-request
 # detail, mostly just echoed the same filename-FP noise the block alerts
@@ -100,6 +121,15 @@ PUBLIC_IP="unknown"
 # Discord renders ANSI SGR codes inside ```ansi fenced code blocks.
 RED=$'\e[1;31m'; GRN=$'\e[1;32m'; YEL=$'\e[1;33m'; CYN=$'\e[1;36m'; GRY=$'\e[2;37m'; RST=$'\e[0m'
 
+# DETECT (SecRuleEngine DetectionOnly, filter.d/modsec-detect.conf) gets its
+# own color/icon/title so it reads as distinct from a real BLOCK in Discord
+# -- this would have been denied, but wasn't.
+if [ "$LEVEL" = "DETECT" ]; then
+  ALERT_COLOR="$YEL"; ALERT_ICON="🔍"; ALERT_TITLE="ModSec DETECT-ONLY Alert (would have blocked)"
+else
+  ALERT_COLOR="$RED"; ALERT_ICON="🛡️"; ALERT_TITLE="ModSec BLOCK Alert"
+fi
+
 # Full-file grep/awk against this audit log (unrotated, multi-GB and growing)
 # was taking 40-60s+ under load and getting killed by fail2ban's action
 # timeout before ever reaching the curl call below -- confirmed 2026-08-17 on
@@ -110,16 +140,26 @@ TAIL_LOG="$(mktemp)"
 trap 'rm -f "$TAIL_LOG"' EXIT
 tail -c 20000000 "$AUDIT_LOG" > "$TAIL_LOG" 2>/dev/null
 
-LAST_BLOCK=$(grep "ModSecurity: Access denied with code 403" "$TAIL_LOG" 2>/dev/null | tail -1)
-  UID_RAW=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[unique_id ")[^"]+' | head -1)
+# BLOCK looks for the actual "Access denied" line; DETECT (SecRuleEngine
+# DetectionOnly) never produces that line -- the same 949110 anomaly-score
+# rule instead logs as a Warning (see filter.d/modsec-detect.conf). Keeping
+# these as two distinct greps (rather than one pattern covering both) means
+# a BLOCK invocation can never accidentally pick up a DETECT-only line or
+# vice versa.
+if [ "$LEVEL" = "DETECT" ]; then
+  LAST_EVENT=$(grep "ModSecurity: Warning" "$TAIL_LOG" 2>/dev/null | grep -F '[id "949110"]' | tail -1)
+else
+  LAST_EVENT=$(grep "ModSecurity: Access denied with code 403" "$TAIL_LOG" 2>/dev/null | tail -1)
+fi
+  UID_RAW=$(printf '%s' "$LAST_EVENT" | grep -oP '(?<=\[unique_id ")[^"]+' | head -1)
   UID_SAFE=""
   if [[ "$UID_RAW" =~ ^[0-9]+\.[0-9]+$ ]]; then
     UID_SAFE="$UID_RAW"
   fi
 
-  SCORE=$(printf '%s' "$LAST_BLOCK" | grep -oP "(?<=Value: \`)[0-9]+" | head -1)
+  SCORE=$(printf '%s' "$LAST_EVENT" | grep -oP "(?<=Value: \`)[0-9]+" | head -1)
   [ -z "$SCORE" ] && SCORE="?"
-  API_URI=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[uri ")[^"]+' | head -1)
+  API_URI=$(printf '%s' "$LAST_EVENT" | grep -oP '(?<=\[uri ")[^"]+' | head -1)
   [ -z "$API_URI" ] && API_URI="(unknown)"
 
   TS="(unknown)"
@@ -168,7 +208,12 @@ except Exception:
 
     DIV="────────────────────────────────────"
     RULE_NUM=0
-    WARNINGS=$(grep -F -- "unique_id \"${UID_SAFE}\"" "$TAIL_LOG" 2>/dev/null | grep "ModSecurity: Warning")
+    # Excludes id 949110 itself: in DETECT mode that's the summary line
+    # LAST_EVENT already came from (would otherwise show up twice -- once as
+    # the alert header, once again as "rule 1" in this per-rule breakdown).
+    # In BLOCK mode this exclusion is a no-op: 949110 there logs as "Access
+    # denied", never "Warning", so it was never in this grep's output anyway.
+    WARNINGS=$(grep -F -- "unique_id \"${UID_SAFE}\"" "$TAIL_LOG" 2>/dev/null | grep "ModSecurity: Warning" | grep -v -F '[id "949110"]')
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       RID=$(printf '%s' "$line" | grep -oP '(?<=\[id ")[0-9]+' | head -1)
@@ -196,7 +241,7 @@ except Exception:
 [ -z "$RULES_TEXT" ] && RULES_TEXT="(no rule detail found -- check unique_id lookup)"
   DIV_EQ="════════════════════════════════════"
   DIV_DA="────────────────────────────────────"
-  INTERNAL_IP=$(printf '%s' "$LAST_BLOCK" | grep -oP '(?<=\[hostname ")[^"]+' | head -1)
+  INTERNAL_IP=$(printf '%s' "$LAST_EVENT" | grep -oP '(?<=\[hostname ")[^"]+' | head -1)
 
   # Full request line (method+path+query) when found; fall back to the
   # path-only [uri] field from the block line if Section B lookup failed.
@@ -208,12 +253,12 @@ except Exception:
   STALE_BANNER=""
   if [ "${STALE:-0}" -eq 1 ]; then
     STALE_BANNER="$(printf '%s⚠️  AUDIT LOG STALE (entry is %ss old)%s' "$RED" "$AGE" "$RST")"$'\n'
-    STALE_BANNER+="$(printf '%sBan on src=%s is real (matched live nginx error.log) -- but the detail below is the LAST entry modsec_audit.log ever wrote, not this ban. modsec_audit.log has likely stopped appending. Check SecAuditEngine/SecAuditLog path + logrotate reopen signal.%s' "$YEL" "$SRC_IP" "$RST")"$'\n'
+    STALE_BANNER+="$(printf '%sThis alert on src=%s is real (matched live nginx error.log) -- but the detail below is the LAST entry modsec_audit.log ever wrote, not this event. modsec_audit.log has likely stopped appending. Check SecAuditEngine/SecAuditLog path + logrotate reopen signal.%s' "$YEL" "$SRC_IP" "$RST")"$'\n'
     STALE_BANNER+="${GRY}${DIV_DA}${RST}"$'\n'
   fi
 
   MSG=$(cat <<MSGEOF
-${RED}🛡️ ModSec BLOCK Alert${RST}
+${ALERT_COLOR}${ALERT_ICON} ${ALERT_TITLE}${RST}
 ${GRY}${DIV_EQ}${RST}
 ${STALE_BANNER}
 📅 ${CYN}วันที่/เวลา${RST}  : ${TS}
@@ -274,6 +319,24 @@ findtime = 60
 # enough to sit outside fail2ban's internal tick/debounce edge case.
 bantime  = 30
 action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
+
+[modsec-detect-alert]
+# Covers boxes/vhosts running SecRuleEngine DetectionOnly, where ModSecurity
+# never emits the "Access denied" line the modsec-block-alert jail above
+# watches for -- it logs the same anomaly-score-exceeded event as a Warning
+# instead (see filter.d/modsec-detect.conf). Same logpath/dedup rationale as
+# modsec-block-alert; kept as a separate jail (not folded into the block
+# filter) so the action can pass a distinct level and the alert script can
+# tell a real block apart from a would-have-blocked detection.
+enabled  = true
+filter   = modsec-detect
+logpath  = /var/log/nginx/error.log
+           /var/log/nginx/*error*.log
+backend  = auto
+maxretry = 1
+findtime = 60
+bantime  = 30
+action   = discord-alert[level="DETECT", discord_webhook="%(discord_webhook)s"]
 EOF_D
 chmod 640 /etc/fail2ban/jail.d/modsec-alert.local
 
@@ -296,6 +359,9 @@ sleep 1
 fail2ban-client status
 echo "--- jail: modsec-block-alert ---"
 fail2ban-client status modsec-block-alert
+echo "--- jail: modsec-detect-alert ---"
+fail2ban-client status modsec-detect-alert
 echo "public IP baked in: $(cat /etc/modsec-alert-public-ip)"
 echo "INSTALL_OK $(hostname)"
 echo "Next: trigger a real block on this host and confirm the Discord message lands."
+echo "Next (if this box runs SecRuleEngine DetectionOnly): trigger a would-block request and confirm modsec-detect-alert fires -- the 949110 regex in filter.d/modsec-detect.conf is unverified against a real DetectionOnly log line, validate with fail2ban-regex first."
