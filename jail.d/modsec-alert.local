@@ -22,17 +22,15 @@ bantime  = 30
 action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
 
 [modsec-detect-alert]
-# Covers boxes/vhosts running SecRuleEngine DetectionOnly, where ModSecurity
-# never emits the "Access denied" line the modsec-block-alert jail above
-# watches for -- it logs the same anomaly-score-exceeded event as a Warning
-# instead (see filter.d/modsec-detect.conf). Same logpath/dedup rationale as
-# modsec-block-alert; kept as a separate jail (not folded into the block
-# filter) so the action can pass a distinct level and the alert script can
-# tell a real block apart from a would-have-blocked detection.
+# Covers boxes running SecRuleEngine DetectionOnly. Watches modsec_audit.log,
+# not error_log: the nginx connector never writes Warning-level rule matches
+# to error_log (confirmed 2026-09-21, see filter.d/modsec-detect.conf).
+# "tail" starts at end of file so a restart doesn't rescan a multi-GB log.
+# Test from a non-local IP: fail2ban ignores 127.0.0.1 (ignoreself), so a
+# `curl https://localhost/...` test will never alert.
 enabled  = true
 filter   = modsec-detect
-logpath  = /var/log/nginx/error.log
-           /var/log/nginx/*error*.log
+logpath  = /var/log/modsec_audit.log tail
 backend  = auto
 maxretry = 1
 findtime = 60

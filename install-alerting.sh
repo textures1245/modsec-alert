@@ -43,23 +43,29 @@ ignoreregex =
 EOF_A
 
 cat > /etc/fail2ban/filter.d/modsec-detect.conf <<'EOF_B'
-# Detects the CRS "Inbound Anomaly Score Exceeded" summary rule (id 949110)
-# logged as Warning -- this is the DetectionOnly-mode equivalent of the
-# block line in modsec-block.conf: a single per-request summary line, not
-# one of the many individual contributing-rule warnings, so it stays as
-# low-volume as the block alert instead of repeating the noise that got the
-# old modsec-warning-spike jail (rate-counted over EVERY Warning line)
-# removed. In blocking mode this same rule instead produces "Access denied"
-# (matched by modsec-block.conf), never "Warning", so this filter does not
-# double-fire alongside the block jail.
+# Detects CRS rule 949110 ("Inbound Anomaly Score Exceeded") logged as
+# Warning, i.e. a would-have-blocked request on a SecRuleEngine DetectionOnly
+# box. In blocking mode the same rule logs "Access denied" instead (caught by
+# modsec-block.conf), so the two jails never double-fire.
 #
-# UNVERIFIED against a live DetectionOnly box -- no confirmed real sample
-# yet (unlike modsec-block.conf's t_1783925596 sample). Validate the exact
-# line shape with `fail2ban-regex` against a real error.log entry before
-# relying on this in production; CRS's msg text can drift across versions,
-# hence anchoring on the rule id token rather than message wording.
+# Reads modsec_audit.log, NOT nginx error_log: confirmed live on
+# OneBox-Proxy01-UAT (2026-09-21, t_1789988729) that the nginx connector only
+# writes disruptive actions to error_log -- Warning lines never appear there
+# at error/notice/info level, only in the audit log's Section H.
+#
+# Audit entries are multi-line: client IP is on the Section A line, the
+# 949110 Warning is several lines later in Section H. The skip group refuses
+# to cross another "---TAG---A--" marker, so a Warning is never attributed to
+# the previous transaction's IP. The date prefix is optional in the regex
+# because fail2ban may cut the matched timestamp out of the line.
+# Alert-only (this fleet never bans); a crafted request body could still
+# spoof lines here, which at worst mislabels the source IP in Discord.
+[Init]
+maxlines = 100
+
 [Definition]
-failregex = \[client <HOST>\] ModSecurity: Warning\. .*\[id "949110"\]
+failregex = ^---[A-Za-z0-9]+---A--\n(?:\[[^\]]+\])?\s*\S+ <HOST> \d+ \S+ \d+\s*\n(?:(?!---[A-Za-z0-9]+---A--)[^\n]*\n)*?ModSecurity: Warning\. .*\[id "949110"\]
+datepattern = ^\[%%d/%%b/%%Y:%%H:%%M:%%S %%z\]
 ignoreregex =
 EOF_B
 
@@ -321,17 +327,15 @@ bantime  = 30
 action   = discord-alert[level="BLOCK", discord_webhook="%(discord_webhook)s"]
 
 [modsec-detect-alert]
-# Covers boxes/vhosts running SecRuleEngine DetectionOnly, where ModSecurity
-# never emits the "Access denied" line the modsec-block-alert jail above
-# watches for -- it logs the same anomaly-score-exceeded event as a Warning
-# instead (see filter.d/modsec-detect.conf). Same logpath/dedup rationale as
-# modsec-block-alert; kept as a separate jail (not folded into the block
-# filter) so the action can pass a distinct level and the alert script can
-# tell a real block apart from a would-have-blocked detection.
+# Covers boxes running SecRuleEngine DetectionOnly. Watches modsec_audit.log,
+# not error_log: the nginx connector never writes Warning-level rule matches
+# to error_log (confirmed 2026-09-21, see filter.d/modsec-detect.conf).
+# "tail" starts at end of file so a restart doesn't rescan a multi-GB log.
+# Test from a non-local IP: fail2ban ignores 127.0.0.1 (ignoreself), so a
+# `curl https://localhost/...` test will never alert.
 enabled  = true
 filter   = modsec-detect
-logpath  = /var/log/nginx/error.log
-           /var/log/nginx/*error*.log
+logpath  = /var/log/modsec_audit.log tail
 backend  = auto
 maxretry = 1
 findtime = 60
@@ -364,4 +368,4 @@ fail2ban-client status modsec-detect-alert
 echo "public IP baked in: $(cat /etc/modsec-alert-public-ip)"
 echo "INSTALL_OK $(hostname)"
 echo "Next: trigger a real block on this host and confirm the Discord message lands."
-echo "Next (if this box runs SecRuleEngine DetectionOnly): trigger a would-block request and confirm modsec-detect-alert fires -- the 949110 regex in filter.d/modsec-detect.conf is unverified against a real DetectionOnly log line, validate with fail2ban-regex first."
+echo "Next (if this box runs SecRuleEngine DetectionOnly): validate first with: tail -c 2000000 /var/log/modsec_audit.log > /tmp/audit-sample.log && fail2ban-regex /tmp/audit-sample.log /etc/fail2ban/filter.d/modsec-detect.conf -- then send a would-block request from a NON-local IP (127.0.0.1 is ignored) and confirm modsec-detect-alert fires."
