@@ -170,6 +170,7 @@ fi
 
   TS="(unknown)"
   RULES_TEXT=""
+  RULE_IDS=""
   REQ_LINE=""
   BODY_RAW=""
   if [ -n "$UID_SAFE" ]; then
@@ -235,6 +236,7 @@ except Exception:
       [ -z "$RID" ] && continue
       [ -z "$RMSG" ] && RMSG="(no msg)"
       RULE_NUM=$((RULE_NUM + 1))
+      RULE_IDS+="${RID},"
       [ "$RULE_NUM" -gt 1 ] && RULES_TEXT+="${GRY}${DIV}${RST}"$'\n'
       RULES_TEXT+=$(printf '%d) [%s%s%s] %s' "$RULE_NUM" "$YEL" "$RID" "$RST" "$RMSG")
       RULES_TEXT+=$'\n'
@@ -313,7 +315,7 @@ fi
   MSG=$(cat <<MSGEOF
 ${ALERT_COLOR}${ALERT_ICON} ${ALERT_TITLE}${RST}
 ${GRY}${DIV_EQ}${RST}
-${STALE_BANNER}
+${STALE_BANNER}${MUTE_BANNER}
 📅 ${CYN}วันที่/เวลา${RST}  : ${TS}
 🖥️  ${CYN}โฮสต์ (VM)${RST}   : ${HOST}
 🌐 ${CYN}Public IP${RST}    : ${GRN}${PUBLIC_IP}${RST}
@@ -344,6 +346,10 @@ printf '%s level=%s jail=%s src=%s stale=%s age=%s curl_exit=%s http=%s resp=%s\
 if [ "$CURL_EXIT" -ne 0 ] || [ "$HTTP_CODE" != "204" ]; then
   exit 1
 fi
+
+# Count only alerts Discord actually accepted, so a failed post never burns
+# one of the DEDUP_MAX slots.
+printf '%s %s %s\n' "$D_COUNT" "$D_FIRST" "$D_MUTE_UNTIL" > "$STATE_FILE"
 
 EOF_E
 chmod 700 /usr/local/bin/modsec-discord-alert.sh
