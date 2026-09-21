@@ -263,6 +263,53 @@ except Exception:
     STALE_BANNER+="${GRY}${DIV_DA}${RST}"$'\n'
   fi
 
+# Repeat-alert suppression (BLOCK and DETECT alike). The same incident -- same
+# level + attacker IP + method/path (query string dropped) + matched rule ids
+# -- is sent at most DEDUP_MAX times; the last one carries a "muted" banner,
+# then that incident stays silent for DEDUP_MUTE_SECS. After the mute expires
+# the counter resets and the next hit alerts again. Unique ID and timestamp
+# are deliberately NOT part of the key (they differ on every request).
+# Suppressed hits are still logged to LOGFILE with suppressed=1.
+# Reset one/all mutes by hand: rm /var/lib/modsec-discord-alert/<key|*>
+DEDUP_MAX=3
+DEDUP_MUTE_SECS=14400
+DEDUP_DIR="/var/lib/modsec-discord-alert"
+mkdir -p "$DEDUP_DIR" && chmod 700 "$DEDUP_DIR"
+REQ_SIG=$(printf '%s' "${REQ_LINE:-$API_URI}" | awk '{ if (NF >= 2) print $1 " " $2; else print $0 }')
+REQ_SIG="${REQ_SIG%%\?*}"
+RULE_SIG=$(printf '%s' "$RULE_IDS" | tr ',' '\n' | grep -v '^$' | sort -u | paste -sd, -)
+DEDUP_KEY=$(printf '%s|%s|%s|%s' "$LEVEL" "$SRC_IP" "$REQ_SIG" "$RULE_SIG" | sha256sum | cut -c1-32)
+STATE_FILE="$DEDUP_DIR/$DEDUP_KEY"
+# Serialize read-modify-write across concurrent fail2ban action runs; lock is
+# held until this script exits (fd 9 closes).
+exec 9>"$DEDUP_DIR/.lock"
+flock -w 10 9 || true
+find "$DEDUP_DIR" -type f ! -name .lock -mmin +600 -delete 2>/dev/null
+NOW=$(date +%s)
+D_COUNT=0; D_FIRST=0; D_MUTE_UNTIL=0
+[ -r "$STATE_FILE" ] && read -r D_COUNT D_FIRST D_MUTE_UNTIL < "$STATE_FILE"
+[[ "$D_COUNT" =~ ^[0-9]+$ ]] || D_COUNT=0
+[[ "$D_FIRST" =~ ^[0-9]+$ ]] || D_FIRST=0
+[[ "$D_MUTE_UNTIL" =~ ^[0-9]+$ ]] || D_MUTE_UNTIL=0
+
+if [ "$D_MUTE_UNTIL" -gt "$NOW" ]; then
+  printf '%s level=%s jail=%s src=%s suppressed=1 key=%s req=%s rules=%s muted_until=%s\n' \
+    "$(date -Is)" "$LEVEL" "$JAIL" "$SRC_IP" "$DEDUP_KEY" "$REQ_SIG" "$RULE_SIG" "$(date -d "@$D_MUTE_UNTIL" -Is)" >> "$LOGFILE"
+  exit 0
+fi
+# Mute expired, or first hit is outside the counting window -> start fresh.
+if [ "$D_MUTE_UNTIL" -gt 0 ] || [ $(( NOW - D_FIRST )) -ge "$DEDUP_MUTE_SECS" ]; then
+  D_COUNT=0; D_FIRST="$NOW"; D_MUTE_UNTIL=0
+fi
+D_COUNT=$(( D_COUNT + 1 ))
+MUTE_BANNER=""
+if [ "$D_COUNT" -ge "$DEDUP_MAX" ]; then
+  D_MUTE_UNTIL=$(( NOW + DEDUP_MUTE_SECS ))
+  MUTE_BANNER="$(printf '%s🔕 แจ้งเตือนซ้ำครั้งที่ %s/%s -- เหตุการณ์นี้ (IP + Request + Rules เดิม) จะถูกปิดเสียงถึง %s%s' "$GRY" "$D_COUNT" "$DEDUP_MAX" "$(date -d "@$D_MUTE_UNTIL" '+%d/%b/%Y %H:%M:%S %z')" "$RST")"$'\n'
+elif [ "$D_COUNT" -gt 1 ]; then
+  MUTE_BANNER="$(printf '%s🔁 แจ้งเตือนซ้ำครั้งที่ %s/%s%s' "$GRY" "$D_COUNT" "$DEDUP_MAX" "$RST")"$'\n'
+fi
+
   MSG=$(cat <<MSGEOF
 ${ALERT_COLOR}${ALERT_ICON} ${ALERT_TITLE}${RST}
 ${GRY}${DIV_EQ}${RST}
