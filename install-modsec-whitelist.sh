@@ -11,9 +11,12 @@
 #       192.168.70.0/24
 #
 #   /etc/modsecurity/whitelist-ip-path.txt   -- IP bypass only on one path
-#     <ip_or_cidr>[,...]  <path>  [all | <rule_id>[,<rule_id>|<from>-<to>...]]
+#     <ip_or_cidr>[,...] | any  <path>  [all | <rule_id>[,<rule_id>|<from>-<to>...]]
 #       203.154.27.43  /admin/api/send_email_by_template_with_cc
 #       203.154.27.43  /admin/api/*   942100,941100-941999
+#       any            /admin/api/register_business_v2   942100
+#     IP "any": every client (path-only). Do NOT use 0.0.0.0/0 -- libmodsecurity
+#     v3 rejects a /0 CIDR in @ipMatch and nginx -t fails.
 #     path: exact match, or prefix match when it ends in "*"
 #     3rd column: "all" (default) turns ModSecurity off for that request;
 #                 rule ids only remove those rules, everything else still runs
@@ -70,7 +73,8 @@ fi
 if [ ! -f "$PATH_FILE" ]; then
   cat > "$PATH_FILE" <<'EOF_PATH'
 # IP + path bypass. Columns (whitespace-separated):
-#   <ip_or_cidr>[,...]  <path>  [all | <rule_id>[,<rule_id>|<from>-<to>...]]
+#   <ip_or_cidr>[,...] | any  <path>  [all | <rule_id>[,<rule_id>|<from>-<to>...]]
+# IP "any" = every client (path-only exclusion). Never 0.0.0.0/0 (rejected).
 # path ending in * = prefix match, otherwise exact match (query string ignored).
 # 3rd column: all (default) = ModSecurity off for that request,
 #             rule ids = only those rules removed, the rest still inspect.
@@ -123,7 +127,10 @@ while IFS= read -r line; do
   f_rules="${f_rules:-all}"
   [ -n "${f_extra:-}" ] && { err "$src: too many columns"; continue; }
   [ -n "${f_path:-}" ] || { err "$src: missing path"; continue; }
-  check_ips "$src" "$f_ip"
+  if [ "$f_ip" != "any" ]; then
+    check_ips "$src" "$f_ip"
+    [[ "$f_ip" =~ (^|,)(0\.0\.0\.0|::)/0(,|$) ]] && { err "$src: /0 CIDR is rejected by libmodsecurity -- use 'any' for every client"; continue; }
+  fi
   [[ "$f_path" =~ $PATH_RE ]] || { err "$src: invalid path '$f_path' (must start with /, no quotes/spaces/backslashes, * only at end)"; continue; }
   [[ "$f_rules" =~ $RULES_RE ]] || { err "$src: invalid rule list '$f_rules' (all, or ids like 942100,941100-941999)"; continue; }
 
@@ -144,8 +151,12 @@ while IFS= read -r line; do
   # normalized path so "/admin/api/x/../../other" or %2e%2e tricks can't
   # reach a different path while riding a prefix whitelist.
   PATH_RULES+="# $PATH_FILE line $n: $f_ip $f_path $f_rules"$'\n'
-  PATH_RULES+="SecRule REMOTE_ADDR \"@ipMatch ${f_ip}\" \"id:${id},phase:1,pass,nolog,chain\""$'\n'
-  PATH_RULES+="    SecRule REQUEST_FILENAME \"${OP}\" \"t:none,t:urlDecodeUni,t:normalizePath,${CTL}\""$'\n'
+  if [ "$f_ip" = "any" ]; then
+    PATH_RULES+="SecRule REQUEST_FILENAME \"${OP}\" \"id:${id},phase:1,pass,nolog,t:none,t:urlDecodeUni,t:normalizePath,${CTL}\""$'\n'
+  else
+    PATH_RULES+="SecRule REMOTE_ADDR \"@ipMatch ${f_ip}\" \"id:${id},phase:1,pass,nolog,chain\""$'\n'
+    PATH_RULES+="    SecRule REQUEST_FILENAME \"${OP}\" \"t:none,t:urlDecodeUni,t:normalizePath,${CTL}\""$'\n'
+  fi
   id=$((id + 1))
 done < <(strip "$PATH_FILE")
 
