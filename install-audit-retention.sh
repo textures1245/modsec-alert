@@ -13,16 +13,27 @@
 #     --now           rotate immediately after install (use on boxes where the
 #                     audit log is already multi-GB)
 #
-# Why rename + create + nginx reload, NOT copytruncate:
-#   - copytruncate copies the whole file every rotation (multi-GB here) and
-#     drops any lines written between the copy and the truncate.
-#   - libmodsecurity keeps the audit log fd open. A plain rename without a
-#     reopen means ModSecurity keeps writing into the rotated file and the live
-#     path goes silent -- the "audit log stale" failure the Discord alert
-#     already detects (pueantaecloud/box-dedicate). nginx reload (HUP) rebuilds
-#     the ModSecurity rule set, which reopens SecAuditLog at the new file.
-#   - fail2ban's modsec-detect-alert jail follows the path and picks up the new
-#     file after rotation on its own.
+# Why copytruncate, NOT rename + create + nginx reload:
+#   - libmodsecurity v3 NEVER reopens the audit log on nginx reload. Its
+#     SharedFiles keeps open FILE* handles keyed by file NAME and reuses them
+#     when the reloaded config names the same path; the fclose in its close
+#     path is commented out (src/utils/shared_files.cc, 3.0.12). Verified on
+#     3.0.16: after a rename, neither `nginx -s reload` (HUP) nor
+#     `nginx -s reopen` (USR1) moves writes to the new file -- only a full
+#     restart does. The previous rename+reload version of this script left
+#     the live file at 0 bytes after the first rotation (OneBox-Proxy01-UAT,
+#     2026-09-24 00:00) while ModSecurity kept writing the rotated file, so
+#     every Discord alert showed "(unknown)" details.
+#   - copytruncate keeps the same inode. ModSecurity opens the file with
+#     fopen("a") (O_APPEND), so after the truncate its next write lands at
+#     the new end of file: no restart, no NUL-filled sparse gap (verified).
+#   - fail2ban's modsec-detect-alert jail (logpath ... tail) keeps following
+#     the file across a copytruncate -- verified with backend polling and
+#     auto/pyinotify: a DETECT hit after rotation still fires.
+#   - Cost: the whole live file is copied once per rotation (needs that much
+#     free disk for a moment), and lines ModSecurity writes between the copy
+#     and the truncate are lost -- a window of the copy duration, once a day.
+#     A smaller max_size keeps both small.
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -63,18 +74,33 @@ if [ -n "$DUP" ]; then
   exit 1
 fi
 
-# Recreate the new file with the same owner/mode the current one has, since
-# that's whatever this box's nginx/ModSecurity is known to write successfully.
-if [ -f "$AUDIT_LOG" ]; then
-  read -r MODE OWNER GROUP < <(stat -c '%a %U %G' "$AUDIT_LOG")
-else
-  MODE=640; OWNER=root; GROUP=adm
+# A box rotated by the old rename+reload version still has ModSecurity
+# writing a renamed file (live path empty). copytruncate can't fix that --
+# only moving the file ModSecurity writes back onto the live path, or a
+# restart, can. Detect it and say so instead of rotating an empty file.
+WRITTEN=""
+if [ -d /proc ]; then
+  for p in $(pgrep -f 'nginx: (master|worker)' 2>/dev/null); do
+    for fd in /proc/"$p"/fd/*; do
+      t=$(readlink "$fd" 2>/dev/null) || continue
+      case "$t" in "$AUDIT_LOG"*) WRITTEN+="$t"$'\n' ;; esac
+    done
+  done
+fi
+WRITTEN=$(printf '%s' "$WRITTEN" | sort -u | sed '/^$/d')
+if [ -n "$WRITTEN" ] && ! printf '%s\n' "$WRITTEN" | grep -qxF "$AUDIT_LOG"; then
+  echo "WARN: nginx/ModSecurity is NOT writing $AUDIT_LOG, it is writing:" >&2
+  printf '  %s\n' $WRITTEN >&2
+  echo "  (left over from the old rename+reload rotation). Fix, no restart needed:" >&2
+  echo "    mv -f '$(printf '%s' "$WRITTEN" | head -1 | sed 's/ (deleted)$//')' $AUDIT_LOG" >&2
+  echo "  then re-run this script. (If it says '(deleted)': systemctl restart nginx.)" >&2
 fi
 
 cat > "$CONF" <<EOF_R
 # Managed by install-audit-retention.sh -- edit that script and re-run it.
 # Keeps ${DAYS} rotated days; also rotates early past ${MAXSIZE} (checked at
-# the daily logrotate run).
+# the daily logrotate run). copytruncate: libmodsecurity never reopens the
+# audit log on nginx reload -- see the script header before changing this.
 ${AUDIT_LOG} {
     daily
     maxsize ${MAXSIZE}
@@ -83,24 +109,11 @@ ${AUDIT_LOG} {
     missingok
     notifempty
     compress
-    # Rotated file stays plain for one cycle: any line ModSecurity writes
-    # between the rename and the reload lands there, not in a gzip.
     delaycompress
     dateext
     dateformat -%Y%m%d-%s
-    create ${MODE} ${OWNER} ${GROUP}
+    copytruncate
     su root root
-    sharedscripts
-    postrotate
-        # Reload so ModSecurity reopens SecAuditLog. If the nginx config is
-        # currently broken, reload would be refused anyway -- log it loudly
-        # instead; the Discord alert will then show "AUDIT LOG STALE".
-        if nginx -t -q >/dev/null 2>&1; then
-            systemctl reload nginx >/dev/null 2>&1 || { [ -s /run/nginx.pid ] && kill -HUP "\$(cat /run/nginx.pid)"; } || true
-        else
-            logger -t modsec-audit-retention "nginx -t failed: nginx NOT reloaded after rotating ${AUDIT_LOG}; ModSecurity still writing to rotated file"
-        fi
-    endscript
 }
 EOF_R
 chmod 644 "$CONF"
@@ -113,9 +126,9 @@ if [ "$ROTATE_NOW" -eq 1 ]; then
   logrotate -f -v "$CONF"
   sleep 2
   ls -lh "${AUDIT_LOG}"* 2>/dev/null
-  echo "Check the live file is growing again (send any request that ModSecurity logs):"
+  echo "Check the live file keeps growing (send any request that ModSecurity logs):"
   echo "  ls -l $AUDIT_LOG ; sleep 30 ; ls -l $AUDIT_LOG"
 fi
 
-echo "installed: $CONF (keep ${DAYS} days, early rotate > ${MAXSIZE}, create ${MODE} ${OWNER} ${GROUP})"
+echo "installed: $CONF (keep ${DAYS} days, early rotate > ${MAXSIZE}, copytruncate)"
 echo "RETENTION_OK $(hostname)"
