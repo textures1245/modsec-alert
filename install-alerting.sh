@@ -334,11 +334,22 @@ MSGEOF
 
 PAYLOAD=$(printf '```ansi\n%s\n```' "$MSG" | python3 -c 'import json,sys; print(json.dumps({"content": sys.stdin.read()}))')
 
+# Posted via curl --data-binary @file rather than inline -d "$PAYLOAD": inline
+# would put the full alert text -- including the attacker's raw exploit-
+# looking payload (e.g. JNDI/java.lang.ProcessBuilder strings from a blocked
+# RCE probe) -- directly into curl's process argv, which is exactly what EDR
+# command-line scanners pattern-match against (confirmed false-positive
+# trigger for CrowdStrike's ExploitLin IOA, 2026-10-06, box-dedicate.one.th /
+# INET 261005999). Reading from file keeps identical Discord content with
+# nothing exploit-looking ever appearing in process telemetry.
+PAYLOAD_FILE="$(mktemp)"
+chmod 600 "$PAYLOAD_FILE"
+printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
 RESP_FILE="$(mktemp)"
-HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -m 5 -X POST -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK" 2>>"$LOGFILE")
+HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -m 5 -X POST -H "Content-Type: application/json" --data-binary @"$PAYLOAD_FILE" "$WEBHOOK" 2>>"$LOGFILE")
 CURL_EXIT=$?
 RESP_BODY=$(head -c 300 "$RESP_FILE" 2>/dev/null)
-rm -f "$RESP_FILE"
+rm -f "$RESP_FILE" "$PAYLOAD_FILE"
 
 printf '%s level=%s jail=%s src=%s stale=%s age=%s curl_exit=%s http=%s resp=%s\n' \
   "$(date -Is)" "$LEVEL" "$JAIL" "$SRC_IP" "${STALE:-0}" "${AGE:-NA}" "$CURL_EXIT" "${HTTP_CODE:-none}" "${RESP_BODY:-}" >> "$LOGFILE"
