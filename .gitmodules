@@ -1,0 +1,3 @@
+[submodule "nginx-mod"]
+	path = nginx-mod
+	url = https://github.com/textures1245/nginx-mod.git
