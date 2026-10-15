@@ -36,10 +36,11 @@
 # If `nginx -t` fails, every touched file is restored and nginx is not reloaded.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-13"
+PATCH_VERSION="PV-2026-10-15"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
+  "PV-2026-10-15  FIELDS += json.data.array_0..9.file_path_real (POST /onebox-centrifugo/api/publish, 932370 on Thai cost-estimate path, unique_id 179207345281.765841, EXTEEM-106)."
 )
 
 # Rules excluded from every FIELDS entry (after CRS). Unknown ids on an older
@@ -61,6 +62,13 @@ FIELDS=(
   json.file_info.full_path json.file_info.display_full_path
   json.file_info.filename json.file_info.origin_filename
   json.destination_path json.err_message
+  # centrifugo publish: libmodsecurity names JSON array items by position, so
+  # every index must be listed. Extend if a payload ever carries >10 files.
+  json.data.array_0.file_path_real json.data.array_1.file_path_real
+  json.data.array_2.file_path_real json.data.array_3.file_path_real
+  json.data.array_4.file_path_real json.data.array_5.file_path_real
+  json.data.array_6.file_path_real json.data.array_7.file_path_real
+  json.data.array_8.file_path_real json.data.array_9.file_path_real
 )
 
 # URI-prefix-scoped ctl: actions (before CRS). "prefix|action action ...".
