@@ -6,9 +6,19 @@
 
 **Endpoint exclusion** — An exclusion scoped to a URL prefix: either a whole rule, or a (rule, target) pair, removed only for requests under that prefix.
 
+**Baseline** — The engine settings a Patch enforces on every box (request/response body handling, limits, audit log format, allowed methods, anomaly thresholds). Part of the Patch, versioned with it.
+
+**Global removal** — A rule switched off for every request on every endpoint. Each one in the Patch carries the reason it was removed.
+
+**Restored rule** — A rule a Patch requires to be active. Any exclusion anywhere that removes it is a gap, not coverage. Used for rules whose removal turns off a whole class of protection (request-body parse failures, blocking evaluation).
+
 **Managed config** — The config files a Patch writes and owns on a box. Never hand-edited.
 
 **Legacy exclusion** — Any exclusion loaded on a box that is not part of the Managed config (hand-written `sec_actions.conf` lines, per-endpoint drafts, whitelist output). Not necessarily wrong; a candidate to retire once the Patch covers it.
+
+**Legacy files** — The hand-maintained exclusion/settings files the old copy-over deploy script wrote (`sec_actions.conf`, `sec_rule_removal.conf`, `sec_base_modsecurity_disable.conf`). Superseded by the Patch.
+
+**Retired statement** — A statement in a Legacy file that the Patch now covers or deliberately replaces; installing the Patch comments it out with a marker so uninstalling can bring it back. Statements the Patch does not cover stay active and are reported.
 
 **Loaded config** — The config files nginx actually loads, found by following the include chain from ModSecurity's main rules file. Files that exist on disk but are not on the chain are **Orphan files** and grant no coverage.
 

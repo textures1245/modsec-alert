@@ -8,16 +8,24 @@
 # "Modsecurity Patch Detail" (tabs: รายการกฎที่ยกเว้น, Patch Version).
 #
 # What it owns (and nothing else):
-#   $MANAGED_DIR/after-crs.conf   SecRuleUpdateTargetById for every RULES x FIELDS
-#                                 pair, generated -- never hand-edit, never paste
-#   $MANAGED_DIR/before-crs.conf  URI-scoped ctl: rules, ids 1009000-1009999
+#   $MANAGED_DIR/before-crs.conf  BASELINE engine settings + CRS tx vars (id 1009900),
+#                                 URI-scoped ctl: rules (ids 1009001+), all generated
+#   $MANAGED_DIR/after-crs.conf   GLOBAL_REMOVE + SecRuleUpdateTargetById for every
+#                                 RULES x FIELDS pair -- never hand-edit, never paste
 #   $MANAGED_DIR/VERSION          installed PATCH_VERSION + content hash
 #   two Include lines in the ModSecurity main config, around the CRS rules Include
-# Hand-maintained exclusions (sec_actions.conf, RESPONSE-999-*.conf,
-# sec_rule_removal.conf, install-modsec-whitelist.sh output) are left alone;
-# duplicates of the same target removal are harmless (target updates
-# accumulate, verified libmodsecurity 3.0.17). --status counts them and
-# --audit lists them so they can be retired box by box.
+#   statements in the LEGACY_FILES next to the main config that this patch
+#   covers or replaces: install comments them out ("#[onebox-patch retired] "),
+#   --uninstall brings them back. Statements it does not cover stay active and
+#   are printed ("kept active"). Missing legacy files are fine.
+# Replaces legacy-patch-modsec-after-install-modec.sh + its rules/ copy-over:
+# do not run that script on a patched box -- it overwrites main.conf (drops
+# the Include lines) and re-adds the bypasses fixed in PV-2026-10-16.
+# Other hand-maintained exclusions (RESPONSE-999-*.conf, whitelist script
+# output) are left alone; duplicates are harmless (target updates accumulate,
+# verified libmodsecurity 3.0.17). --audit lists them so they can be retired.
+#
+# Needs python3 for install (legacy retire) and --audit.
 #
 # The managed files live OUTSIDE the CRS rules dir: re-cloning CRS does not wipe
 # them. install-crs-thai-fix.sh is still separate (it edits CRS in place) and
@@ -32,9 +40,17 @@
 #   ./install-modsec-patch.sh --status    one line per box: version, drift, CRS, thai-fix
 #   ./install-modsec-patch.sh --audit     read-only: is THIS script's patch in effect? (below)
 #   ./install-modsec-patch.sh --audit --json   same, one JSON object (fleet collection)
+#   ./install-modsec-patch.sh --check-body read-only: locations that take >=100 MB bodies with ModSecurity on and no guard
 #   ./install-modsec-patch.sh --print     print the generated config, change nothing
 #   ./install-modsec-patch.sh --uninstall remove the managed files + Include lines
 #   MODSEC_MAIN_CONF=... CRS_RULES_DIR=... ./install-modsec-patch.sh   (override detection)
+#
+# Big-upload guard (PV-2026-10-28): with `modsecurity on` the connector spools
+# the whole body and libmodsecurity then reads it into RAM (~2x its size), so a
+# multi-GB PUT OOM-kills nginx. Install also writes BYPASS_MAP_FILE (the
+# $bypass_waf map: Content-Length >= 9 digits, or chunked). A location opts in
+# by hand (vhosts are never edited) -- see print_bypass_hint; --check-body and
+# the end of install list the locations that still have no guard.
 #
 # If `nginx -t` fails, every touched file is restored and nginx is not reloaded.
 # Install prints what changed vs the previously installed version, then runs
@@ -55,12 +71,115 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-15"
+PATCH_VERSION="PV-2026-10-28"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
   "PV-2026-10-15  FIELDS += json.data.array_0..9.file_path_real (POST /onebox-centrifugo/api/publish, 932370 on Thai cost-estimate path, unique_id 179207345281.765841, EXTEEM-106)."
+  "PV-2026-10-16  Takes over the legacy files (sec_actions / sec_rule_removal / sec_base_modsecurity_disable): BASELINE + GLOBAL_REMOVE + their endpoint rules, legacy statements retired. Security fixes (bypasses confirmed live, libmodsecurity 3.0.17 / CRS 4.29): /onlyofficeds/ 949110 removal no longer matchable from the query string of any URL (REQUEST_URI @rx -> REQUEST_FILENAME prefix, normalized); valid JSON padded past the 128K no-files limit skipped inspection -- closed by restoring 200002 (denies over-limit bodies under ProcessPartial), NoFilesLimit 128K -> 1M; ProcessPartial kept so >13 MB raw PUTs still pass (multipart >13 MB now 400); 200002-200005 restored (body parse / multipart / engine-error checks). All URI-scoped exclusions in the managed config are path-normalized; legacy statements the patch does not cover stay as they were (install prints them)."
+  "PV-2026-10-28  Big-upload guard: manages the nginx http-level \$bypass_waf map (conf.d/onebox-waf-bypass.conf); --check-body and an install-time warning list locations with modsecurity on, client_max_body_size >= 100 MB and no body guard (EXTEEM-106 nginx OOM, 4 GB rclone PUT, task t_1793008028). No change to exclusions or baseline."
 )
+
+# Engine settings enforced on every box, emitted into before-crs.conf so they
+# override modsecurity.conf and the legacy files (last directive loaded wins).
+# Values = what the legacy sec_base_modsecurity_disable.conf ran with, except
+# the two marked FIX.
+BASELINE=(
+  "SecRequestBodyAccess On"
+  "SecRequestBodyLimit 13107200"
+  "SecRequestBodyNoFilesLimit 1048576"        # FIX: was 131072 -- legit JSON up to 1 MiB
+  # ProcessPartial is safe ONLY with 200002 active (RESTORE): libmodsecurity v3
+  # flags an over-limit body as REQBODY_ERROR and 200002 denies it (400), so a
+  # payload padded past the limit is blocked. Raw PUTs (octet-stream, no body
+  # processor) over 13 MB still pass, as before. Reject would also deny those
+  # -- verified: 20 MB rclone/WebDAV PUT 403 under Reject, 200 here.
+  "SecRequestBodyLimitAction ProcessPartial"
+  "SecRequestBodyJsonDepthLimit 10000"
+  "SecArgumentsLimit 100000"
+  "SecPcreMatchLimit 1000000"
+  "SecPcreMatchLimitRecursion 1000000"
+  "SecResponseBodyAccess On"
+  "SecResponseBodyLimit 524288"
+  "SecResponseBodyLimitAction ProcessPartial"
+  "SecResponseBodyMimeType text/plain text/html text/xml application/json application/xml application/javascript text/javascript"
+  "SecAuditEngine RelevantOnly"
+  "SecAuditLogParts ABFHZ"
+  "SecAuditLogType Serial"
+  "SecAuditLog /var/log/modsec_audit.log"
+)
+# CRS variables (phase-1 SecAction, before CRS so 901 keeps them). Threshold 7
+# kept from legacy (CRS default 5) -- lowering it is a separate change.
+BASELINE_TX="tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE MOVE MKCOL PROPFIND PROPPATCH COPY LOCK UNLOCK|tx.inbound_anomaly_score_threshold=7|tx.outbound_anomaly_score_threshold=7"
+
+# Rules switched off for every request. "id|reason" -- kept exactly as the
+# legacy sec_rule_removal.conf / sec_base_modsecurity_disable.conf ran them
+# (FP fixes, hit counts from the legacy file). Narrowing each to the endpoint
+# that needed it is follow-up work; --audit lists them.
+GLOBAL_REMOVE=(
+  "200007|too many arguments (>=1000); SecArgumentsLimit raised instead"
+  "200008|not defined in current modsecurity.conf; kept for older boxes"
+  "920100|invalid HTTP request line (1156 hits)"
+  "920340|Content-Length > 0 without Content-Type"
+  "920350|numeric Host header"
+  "920420|content-type enforcement, rclone octet-stream (43 hits)"
+  "920440|URL file extension restricted (23 hits)"
+  "920450|Expect header"
+  "920470|illegal Content-Type header (22 hits)"
+  "930100|path traversal, needed for file paths (170 hits)"
+  "930130|restricted file, rclone/.DS_Store (110 hits)"
+  "932130|RCE unix shell expression (60 hits)"
+  "932180|restricted file upload (4 hits)"
+  "932260|RCE unix shell code (23 hits)"
+  "933135|PHP injection (2 hits)"
+  "933210|PHP injection (24 hits)"
+  "934100|RFI (6 hits)"
+  "934110|SSRF, OnlyOffice iframe (2 hits)"
+  "934130|RFI common parameter (4 hits)"
+  "934170|generic RFI (20 hits)"
+  "941170|XSS libinjection (20 hits)"
+  "942101|SQLi libinjection (paranoia 2 sibling)"
+  "942360|SQL meta-character anomaly (54 hits)"
+  "942540|SQL comment (6 hits)"
+  "942550|magic quotes bypass (2 hits)"
+  "950100|data leakage in downloaded files"
+  "950110|data leakage in downloaded files"
+  "950120|data leakage in downloaded files"
+  "950130|data leakage in downloaded files"
+  "950140|data leakage in downloaded files"
+  "950150|data leakage in downloaded files"
+  "950160|data leakage in downloaded files"
+  "950170|data leakage in downloaded files"
+  "950180|data leakage in downloaded files"
+  "950190|data leakage in downloaded files"
+  "951190|Ingres SQL information leakage"
+  "953100|session fixation / PHP leakage (98 hits)"
+  "953110|session fixation / PHP leakage (36 hits)"
+  "956100|Ruby errors/stack traces in downloaded files"
+  "956110|Ruby errors/stack traces in downloaded files"
+  "956120|Ruby errors/stack traces in downloaded files"
+  "956130|Ruby errors/stack traces in downloaded files"
+)
+
+# Rules that must stay active: removing any of them switches off a whole class
+# of protection. Install retires legacy removals of them; --audit fails if
+# anything loaded still removes them (globally).
+RESTORE=(200002 200003 200004 200005)
+
+# Legacy statements (by rule id) this patch replaces outright -- retired even
+# though their old scope differs (that difference is the fix).
+#   900110 thresholds, 900200 allowed methods -> BASELINE_TX
+#   900210 onlyofficeds (spoofable @rx)       -> ENDPOINTS /onlyofficeds/
+#   900211 business-drive octet-stream        -> ENDPOINTS /business-drive/
+#   900213 only_office ARGS_NAMES             -> ENDPOINTS /document_editor/...
+#   90215  localsync json.filename 942100     -> covered by RULES x FIELDS
+#   900230 data leakage @rx                   -> ENDPOINTS 5 prefixes
+SUPERSEDED_IDS=(900110 900200 900210 900211 900213 90215 900230)
+
+# Legacy files (next to the ModSecurity main config) whose covered statements
+# install retires. Missing files are fine (fresh nginx-mod installs).
+LEGACY_FILES=(sec_actions.conf sec_rule_removal.conf sec_base_modsecurity_disable.conf)
+RETIRE_MARK="#[onebox-patch retired] "
+NOTE_MARK="#[onebox-patch note] "
 
 # Rules excluded from every FIELDS entry (after CRS). Unknown ids on an older
 # CRS are accepted silently by nginx -t (verified, CRS 4.29 / libmodsecurity 3).
@@ -93,9 +212,26 @@ FIELDS=(
 # URI-prefix-scoped ctl: actions (before CRS). "prefix|action action ...".
 # Never move REQUEST_FILENAME exclusions to the global list: they must stay
 # URI-scoped.
+# Response-side data-leakage rules off for file download paths (legacy 900230).
+DATALEAK_OFF=""
+for _r in 951100 951110 951120 951130 951140 951150 951160 951170 951180 951190 951200 951210 951220 \
+          951230 951240 951250 951260 952100 952110 953100 953110 953120 956100 956110 956120 956130 \
+          950100 950110 950120 950130 950140 950150 950160 950170 950180 950190; do
+  DATALEAK_OFF+="${DATALEAK_OFF:+ }ruleRemoveById=$_r"
+done
 ENDPOINTS=(
-  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME"
+  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME ruleRemoveById=920420 ruleRemoveById=930130"
   "/onebox_uploads/api/check_duplicate_inbox|ruleRemoveTargetById=942100;ARGS:json.header_info.Doc_remark1 ruleRemoveTargetById=942100;ARGS:json.header_info.BuyerLineTwo"
+  # legacy 900210, scope FIXED (was REQUEST_URI @rx, matchable from any query
+  # string). 949110 = blocking off for OnlyOffice itself -- FP follow-up open.
+  "/onlyofficeds/|ruleRemoveById=934110 ruleRemoveById=949110"
+  "/document_editor/api/v1/get/only_office|ruleRemoveTargetById=930120;ARGS_NAMES"
+  # legacy 900230 ^/(business-drive|downloads|extension_pdfjs|build|onlyofficeds), same prefixes
+  "/business-drive|$DATALEAK_OFF"
+  "/downloads|$DATALEAK_OFF"
+  "/extension_pdfjs|$DATALEAK_OFF"
+  "/build|$DATALEAK_OFF"
+  "/onlyofficeds|$DATALEAK_OFF"
 )
 
 ID_BASE=1009000
@@ -105,18 +241,30 @@ MARK_BEFORE="# onebox-patch: before CRS -- managed by install-modsec-patch.sh"
 MARK_AFTER="# onebox-patch: after CRS -- managed by install-modsec-patch.sh"
 
 # ---- generation --------------------------------------------------------------
+BASELINE_ID=$((ID_BASE + 900))
+
 gen_after() {
-  local targets="" f r
+  local targets="" f r e
   for f in "${FIELDS[@]}"; do targets+="${targets:+,}!ARGS:$f"; done
   echo "# GENERATED by install-modsec-patch.sh $PATCH_VERSION -- do NOT edit, re-run the script."
+  local ids=""
+  for e in "${GLOBAL_REMOVE[@]}"; do
+    printf '# %s  %s\n' "${e%%|*}" "${e#*|}"
+    ids+="${ids:+ }${e%%|*}"
+  done
+  [ -n "$ids" ] && printf 'SecRuleRemoveById %s\n' "$ids"
   for r in "${RULES[@]}"; do
     printf 'SecRuleUpdateTargetById %s "%s"\n' "$r" "$targets"
   done
 }
 
 gen_before() {
-  local i=0 e prefix actions a ctl id
+  local i=0 e prefix actions a ctl id setvars="" kv
   echo "# GENERATED by install-modsec-patch.sh $PATCH_VERSION -- do NOT edit, re-run the script."
+  for e in "${BASELINE[@]}"; do echo "$e"; done
+  IFS='|' read -ra _tx <<< "$BASELINE_TX"
+  for kv in "${_tx[@]}"; do setvars+=",setvar:'$kv'"; done
+  printf 'SecAction "id:%s,phase:1,pass,nolog,t:none%s"\n' "$BASELINE_ID" "$setvars"
   for e in "${ENDPOINTS[@]}"; do
     i=$((i + 1)); id=$((ID_BASE + i))
     prefix="${e%%|*}"; actions="${e#*|}"; ctl=""
@@ -124,6 +272,28 @@ gen_before() {
     printf 'SecRule REQUEST_FILENAME "@beginsWith %s" "id:%s,phase:1,pass,nolog,t:none,t:urlDecodeUni,t:normalizePath%s"\n' \
       "$prefix" "$id" "$ctl"
   done
+}
+
+# ---- big-upload guard (nginx http level) -------------------------------------
+# Bodies with a Content-Length of BYPASS_MIN_DIGITS+ digits (9 = 100 MB) or
+# chunked (no length) set $bypass_waf=1. A location routes those to a named
+# location that runs `modsecurity_rules 'SecRequestBodyAccess Off'`. Not part
+# of content_hash: it is an nginx file, not ModSecurity config.
+BYPASS_MAP_FILE="/etc/nginx/conf.d/onebox-waf-bypass.conf"
+BYPASS_MIN_DIGITS=9
+BYPASS_MIN_BYTES=100000000
+BYPASS_MARK="# onebox-patch: nginx http-level map -- managed by install-modsec-patch.sh"
+
+gen_bypass_map() {
+  echo "$BYPASS_MARK"
+  echo "# GENERATED by install-modsec-patch.sh $PATCH_VERSION -- do NOT edit, re-run the script."
+  cat <<MAPEOF
+map "\$http_content_length:\$http_transfer_encoding" \$bypass_waf {
+    default                          0;
+    "~^\d{$BYPASS_MIN_DIGITS,}:"      1;   # Content-Length >= 100 MB
+    "~:chunked\$"                    1;   # no Content-Length
+}
+MAPEOF
 }
 
 content_hash() { { gen_before; gen_after; } | sha256sum | cut -c1-12; }
@@ -135,11 +305,16 @@ installed_hash() { cat "$MANAGED_DIR/before-crs.conf" "$MANAGED_DIR/after-crs.co
 manifest() {
   local dir="$1" line prefix
   [ -f "$dir/after-crs.conf" ] && {
+    awk '/^SecRuleRemoveById/ {for (i = 2; i <= NF; i++) print "global-remove " $i}' "$dir/after-crs.conf"
     awk '/^SecRuleUpdateTargetById/ {print "rule " $2}' "$dir/after-crs.conf"
     awk '/^SecRuleUpdateTargetById/ {print $3; exit}' "$dir/after-crs.conf" \
       | tr -d '"' | tr ',' '\n' | sed -n 's/^!ARGS:/field /p'
   }
-  [ -f "$dir/before-crs.conf" ] && grep '^SecRule' "$dir/before-crs.conf" | while IFS= read -r line; do
+  [ -f "$dir/before-crs.conf" ] && {
+    grep -E '^Sec' "$dir/before-crs.conf" | grep -vE '^Sec(Rule|Action) ' | sed 's/^/setting /'
+    grep -E '^SecAction ' "$dir/before-crs.conf" | grep -oE "setvar:'[^']+'" | sed "s/^setvar:'\(.*\)'$/setting \1/"
+  }
+  [ -f "$dir/before-crs.conf" ] && grep '^SecRule ' "$dir/before-crs.conf" | while IFS= read -r line; do
     prefix="$(grep -oP '@beginsWith \K[^"]+' <<<"$line")"
     grep -oE 'ctl:[^,"]+' <<<"$line" | sed "s|^|endpoint $prefix |"
   done
@@ -150,7 +325,7 @@ manifest() {
 print_changes() {
   local old="$1" new="$2" prev="$3" a b
   if [ ! -f "$old/after-crs.conf" ]; then
-    echo "changes: first install -- $(manifest "$new" | grep -c '^rule') rules, $(manifest "$new" | grep -c '^field') fields, $(manifest "$new" | grep -c '^endpoint') endpoint actions"
+    echo "changes: first install -- $(manifest "$new" | grep -c '^rule') rules, $(manifest "$new" | grep -c '^field') fields, $(manifest "$new" | grep -c '^endpoint') endpoint actions, $(manifest "$new" | grep -c '^global-remove') global removals, $(manifest "$new" | grep -c '^setting') baseline settings"
     return 0
   fi
   a="$(manifest "$old" | sort -u)"; b="$(manifest "$new" | sort -u)"
@@ -177,6 +352,10 @@ run_audit() {
   AUD_PATCH_VERSION="$PATCH_VERSION" AUD_PATCH_HASH="$(content_hash)" \
   AUD_INSTALLED="$inst_pv" AUD_STATE="$state" AUD_CRS="${crs:-unknown}" AUD_THAI="$thai" \
   AUD_RULES="${RULES[*]}" AUD_FIELDS="${FIELDS[*]}" AUD_ENDPOINTS="$(printf '%s\n' "${ENDPOINTS[@]}")" \
+  AUD_BASELINE="$(printf '%s\n' "${BASELINE[@]}")" AUD_BASELINE_TX="$BASELINE_TX" \
+  AUD_GLOBAL_REMOVE="$(printf '%s\n' "${GLOBAL_REMOVE[@]}")" AUD_RESTORE="${RESTORE[*]}" \
+  AUD_SUPERSEDED="${SUPERSEDED_IDS[*]}" AUD_LEGACY_FILES="${LEGACY_FILES[*]}" \
+  AUD_RETIRE_MARK="$RETIRE_MARK" AUD_NOTE_MARK="$NOTE_MARK" AUD_MODE="${AUDIT_MODE:-audit}" \
   AUD_NGINX_DIR="${AUDIT_NGINX_DIR:-/etc/nginx}" \
   AUD_SWEEP_DIRS="${AUDIT_SWEEP_DIRS:-/etc/nginx /etc/modsecurity /etc/modsecurity.d}" \
   python3 - <<'PY_AUDIT' || rc=$?
@@ -201,8 +380,8 @@ RULES_REAL, MANAGED_REAL = real(RULES_DIR), real(MANAGED)
 
 # ---------------------------------------------------------------- parsing
 def logical_lines(path):
-    """(lineno, statement) with \\-continuations joined and # comments dropped."""
-    out, buf, start = [], "", 0
+    """(first_line, last_line, statement): \\-continuations joined, # comments dropped."""
+    out, buf, start, n = [], "", 0, 0
     with open(path, encoding="utf-8", errors="replace") as fh:
         for n, raw in enumerate(fh, 1):
             line = raw.rstrip("\r\n")
@@ -214,10 +393,10 @@ def logical_lines(path):
             if line.rstrip().endswith("\\"):
                 buf += line.rstrip()[:-1] + " "
                 continue
-            out.append((start, (buf + line).strip()))
+            out.append((start, n, (buf + line).strip()))
             buf = ""
     if buf.strip():
-        out.append((start, buf.strip()))
+        out.append((start, n, buf.strip()))
     return out
 
 def tokens(s):
@@ -293,7 +472,7 @@ def walk(path, depth=0):
         gaps.append({"kind": "UNKNOWN", "what": "cannot read loaded file %s: %s" % (path, e.strerror)})
         return
     loaded.append(path)
-    for n, text in lines:
+    for n, n_end, text in lines:
         toks = tokens(text)
         if not toks:
             continue
@@ -307,7 +486,7 @@ def walk(path, depth=0):
             for h in hits:
                 walk(h, depth + 1)
             continue
-        stmts.append({"file": path, "line": n, "toks": toks, "order": len(stmts)})
+        stmts.append({"file": path, "line": n, "end": n_end, "toks": toks, "order": len(stmts)})
 
 if not os.path.isfile(MAIN):
     print("AUDIT ERROR: main config %s not found" % MAIN, file=sys.stderr); sys.exit(2)
@@ -320,7 +499,7 @@ engine = "On"
 chain_open = None
 
 def add(st, src, kind, scope, ranges, target, risk, desc, phase=None, ctl=False, extra=""):
-    excl.append({"file": st["file"], "line": st["line"], "order": st["order"], "source": src,
+    excl.append({"file": st["file"], "line": st["line"], "end": st.get("end", st["line"]), "order": st["order"], "source": src,
                  "kind": kind, "scope": scope, "ranges": ranges, "target": target, "risk": risk,
                  "desc": desc, "phase": phase, "ctl": ctl})
 
@@ -334,6 +513,30 @@ def scope_of(toks, chained):
     if var.upper() in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_URI_RAW") and m:
         return ("prefix" if m.group(1) == "beginsWith" else "exact", m.group(2))
     return ("unknown", "%s %s" % (var, op))
+
+# Rules whose removal switches off a whole class of protection, not one check.
+CRITICAL = {
+    949110: "inbound blocking off -- nothing is denied",
+    949111: "inbound blocking off -- nothing is denied",
+    959100: "outbound blocking off",
+    200002: "body parse errors pass -- send invalid JSON/XML and no body rule sees ARGS",
+    200003: "multipart strict errors pass -- multipart evasion",
+    200004: "multipart unmatched boundary passes -- multipart evasion",
+    200005: "engine errors (PCRE limit hit) pass -- oversized input skips regex rules",
+}
+
+def scope_warn(toks, actions, chained):
+    """Why a URI-scoped exclusion can be triggered on the wrong request."""
+    if chained or len(toks) < 3 or toks[0].lower() != "secrule":
+        return ""
+    var, op = toks[1].upper(), toks[2].strip()
+    ts = " ".join(a.lower() for a in actions)
+    if var in ("REQUEST_URI", "REQUEST_URI_RAW", "REQUEST_LINE", "QUERY_STRING", "ARGS") or var.startswith("ARGS:"):
+        if not (op.startswith("@beginsWith") or op.startswith("@streq") or re.match(r"@rx\s+\^", op)):
+            return "SPOOFABLE: matches anywhere incl. query string (?x=...)"
+    if var in ("REQUEST_URI", "REQUEST_FILENAME", "REQUEST_URI_RAW") and "normalizepath" not in ts and "normalisepath" not in ts:
+        return "not path-normalized: /prefix/../other reaches other endpoints"
+    return ""
 
 for st in stmts:
     t = st["toks"]; d = t[0]; dl = d.lower()
@@ -352,6 +555,7 @@ for st in stmts:
             head["_phase"] = phase_of(actions)
             head["_ctls"] = []
             head["_toks"] = t
+            head["_actions"] = actions
             for a in actions:
                 if a.lower().startswith("id:"):
                     try:
@@ -374,6 +578,9 @@ for st in stmts:
             scope = scope_of(head["_toks"], head.get("_chained", False))
         sdesc = {"global": "global", "prefix": "@beginsWith %s", "exact": "@streq %s"}.get(scope[0], "%s")
         sdesc = sdesc % scope[1] if "%s" in sdesc else sdesc
+        if head["_toks"][0].lower() == "secrule" and scope[0] != "unknown":
+            sdesc = "%s %s" % (head["_toks"][1], sdesc)
+        n_before = len(excl)
         for c in head["_ctls"]:
             k, _, v = c.partition("=")
             kl = k.lower()
@@ -390,11 +597,14 @@ for st in stmts:
             elif kl in ("ruleremovebytag", "ruleremovebymsg", "ruleremovetargetbytag", "ruleremovetargetbymsg"):
                 add(head, src, "bytag", scope, [], None, "yellow" if "target" not in kl else "green",
                     "%s  ctl:%s (not evaluated for coverage)" % (sdesc, c), head["_phase"], True)
+        w = scope_warn(head["_toks"], head.get("_actions", []), head.get("_chained", False))
+        for x in excl[n_before:]:
+            x["warn"] = w
         continue
     if crs_def:
         continue
     if dl == "secruleremovebyid":
-        add(st, src, "rule", ("global", ""), id_ranges(" ".join(t[1:])), None, "red", " ".join(t))
+        add(st, src, "rule", ("global", ""), id_ranges(" ".join(t[1:])), None, "red", "global  " + " ".join(t))
     elif dl == "secruleupdatetargetbyid" and len(t) >= 3:
         for tgt in re.split(r"[,|]", t[2]):
             tgt = tgt.strip()
@@ -412,6 +622,61 @@ if not crs_loaded or not any(r in defs for r in map(int, E["AUD_RULES"].split())
     print("AUDIT ERROR: no CRS rule definitions found on the Include chain from %s (rules dir %s) -- refusing to report coverage"
           % (MAIN, RULES_DIR), file=sys.stderr)
     sys.exit(2)
+
+# Whole-rule removals that touch a CRITICAL rule are red wherever they are scoped.
+for x in excl:
+    x.setdefault("warn", "")
+    x["critical"] = ""
+    if x["kind"] == "rule":
+        hit = [CRITICAL[r] for r in sorted(CRITICAL) if in_ranges(r, x["ranges"])]
+        if hit:
+            x["risk"], x["critical"] = "red", "; ".join(sorted(set(hit)))
+
+# ---------------------------------------------------------------- engine settings
+# Last occurrence in load order wins (CRS rule files excluded: their tx defaults
+# only apply when nothing set them earlier).
+SETTING_DIRECTIVES = ["SecRuleEngine", "SecRequestBodyAccess", "SecRequestBodyLimit", "SecRequestBodyNoFilesLimit",
+                      "SecRequestBodyLimitAction", "SecRequestBodyJsonDepthLimit", "SecArgumentsLimit",
+                      "SecPcreMatchLimit", "SecPcreMatchLimitRecursion", "SecResponseBodyAccess", "SecAuditLogParts"]
+TX_SETTINGS = ["inbound_anomaly_score_threshold", "outbound_anomaly_score_threshold", "blocking_paranoia_level",
+               "detection_paranoia_level", "paranoia_level"]
+NOT_SETTINGS = ("secrule", "secaction", "secmarker", "secruleremovebyid", "secruleremovebytag", "secruleremovebymsg",
+                "secruleupdatetargetbyid", "secruleupdatetargetbytag", "secruleupdatetargetbymsg",
+                "secruleupdateactionbyid", "secdefaultaction")
+P_BASELINE = [l.split(None, 1) for l in E.get("AUD_BASELINE", "").splitlines() if l.strip()]
+P_BASELINE_TX = [kv.split("=", 1) for kv in E.get("AUD_BASELINE_TX", "").split("|") if "=" in kv]
+CANON = {d.lower(): d for d in SETTING_DIRECTIVES + [b[0] for b in P_BASELINE]}
+settings = {}
+for st in stmts:
+    if is_crs_rule_file(st["file"]):
+        continue
+    t = st["toks"]
+    if t[0].lower().startswith("sec") and t[0].lower() not in NOT_SETTINGS and len(t) > 1:
+        settings[CANON.get(t[0].lower(), t[0])] = (" ".join(t[1:]), "%s:%d" % (st["file"], st["line"]))
+    if t[0].lower() in ("secaction", "secrule"):
+        for m in re.finditer(r"setvar:'?tx\.(%s)=(\d+)" % "|".join(TX_SETTINGS), t[-1], re.I):
+            settings["tx." + m.group(1).lower()] = (m.group(2), "%s:%d" % (st["file"], st["line"]))
+
+def body_guard_active():
+    """200002 loaded and not removed: over-limit bodies are denied even under ProcessPartial."""
+    return 200002 in defs and not any(x["kind"] == "rule" and in_ranges(200002, x["ranges"]) for x in excl)
+
+def setting_warn(k, v):
+    try:
+        n = int(v.split()[0])
+    except (ValueError, IndexError):
+        n = None
+    if k == "SecRequestBodyLimitAction" and v.lower().startswith("processpartial") and not body_guard_active():
+        return "body past the limit is NOT inspected and 200002 is off -- pad the body, put the payload after it"
+    if k == "SecRuleEngine" and v.lower() != "on":
+        return "not blocking"
+    if k == "SecRequestBodyAccess" and v.lower() != "on":
+        return "request bodies not inspected at all"
+    if k in ("tx.inbound_anomaly_score_threshold",) and n and n > 5:
+        return "above CRS default 5 -- one critical hit alone does not block"
+    if k in ("tx.blocking_paranoia_level", "tx.paranoia_level") and n is not None and n < 1:
+        return "paranoia below 1"
+    return ""
 
 # ---------------------------------------------------------------- coverage
 def target_match(have, want):
@@ -502,6 +767,37 @@ for e in filter(None, E["AUD_ENDPOINTS"].splitlines()):
             s, srcs = status(prefix, int(rid), tgt)
             ep_items.append({"prefix": prefix, "action": a, "state": s, "sources": srcs})
 
+P_GLOBAL_REMOVE = [int(l.split("|", 1)[0]) for l in E.get("AUD_GLOBAL_REMOVE", "").splitlines() if l.strip()]
+P_RESTORE = [int(r) for r in E.get("AUD_RESTORE", "").split()]
+gr_items = []
+for rid in P_GLOBAL_REMOVE:
+    s, srcs = status(None, rid, None)
+    gr_items.append({"rule": rid, "state": s, "sources": srcs})
+
+# Restored rules must not be removed by anything loaded (any scope).
+restore_items = []
+for rid in P_RESTORE:
+    if rid not in defs:
+        restore_items.append({"rule": rid, "state": "NOT-LOADED", "by": []}); continue
+    by = ["%s:%d" % (x["file"], x["line"]) for x in excl
+          if x["kind"] == "rule" and in_ranges(rid, x["ranges"]) and (not x["ctl"] or effective(x, rid))]
+    restore_items.append({"rule": rid, "state": "REMOVED" if by else "ACTIVE", "by": by})
+
+# Baseline settings must be the effective (last loaded) value.
+def norm(v):
+    return " ".join(v.split()).lower()
+baseline_items = []
+for b in P_BASELINE:
+    name, want = CANON.get(b[0].lower(), b[0]), b[1] if len(b) > 1 else ""
+    have, where = settings.get(name, ("(unset)", ""))
+    baseline_items.append({"setting": name, "want": want, "have": have, "at": where, "ok": norm(have) == norm(want)})
+for k, want in P_BASELINE_TX:
+    key = k.lower()
+    if key[3:] not in TX_SETTINGS:
+        continue                          # tx.allowed_methods: string, not tracked
+    have, where = settings.get(key, ("(unset)", ""))
+    baseline_items.append({"setting": key, "want": want, "have": have, "at": where, "ok": norm(have) == norm(want)})
+
 # ---------------------------------------------------------------- inline nginx rules, orphans
 def nginx_files():
     """(path, [lines]) of the nginx config. Prefer the `nginx -T` dump (only
@@ -535,6 +831,10 @@ for p, lines in ngx_files:
         s = line.strip()
         if s.startswith("#"):
             continue
+        # The big-upload guard (only SecRequestBodyAccess Off, see --check-body)
+        # carries no exclusion, so it is not an unknown.
+        if re.match(r"modsecurity_rules\s+([\x27\x22])\s*SecRequestBodyAccess\s+Off\s*;?\s*\1\s*;", s):
+            continue
         if re.match(r"modsecurity_rules(_remote)?\s", s):
             gaps.append({"kind": "UNKNOWN", "what": "inline/remote ModSecurity rules in %s:%d (not audited)" % (p, n)})
         m = re.match(r"modsecurity_rules_file\s+([^;\s]+)", s)
@@ -551,8 +851,17 @@ for d in E["AUD_SWEEP_DIRS"].split():
             if ".conf" not in fn or rp in loaded_real or rp in swept or not os.path.isfile(rp) or os.path.getsize(rp) > 4 << 20:
                 continue
             swept.add(rp)
+            # A stock CRS rule file (backup copy etc.) carries its own ctl: --
+            # not an exclusion anyone wrote. Custom files named like CRS lack the ver tag.
+            if re.match(r"(REQUEST|RESPONSE)-9\d\d-", fn) and "EXCLUSION-RULES" not in fn:
+                try:
+                    with open(rp, encoding="utf-8", errors="replace") as fh:
+                        if "ver:'OWASP_CRS/" in fh.read():
+                            continue
+                except OSError:
+                    continue
             try:
-                n = sum(1 for _, s in logical_lines(p) if EXCL_RE.search(s))
+                n = sum(1 for _, _, s in logical_lines(p) if EXCL_RE.search(s))
             except (OSError, UnicodeError):
                 continue
             if n:
@@ -565,12 +874,17 @@ def counts(items):
         c[i["state"]] += 1
     return c
 
-gc, ec = counts(glob_items), counts(ep_items)
-bad = lambda c: sum(v for k, v in c.items() if k not in ("FULL", "N/A"))
+gc, ec, grc = counts(glob_items), counts(ep_items), counts(gr_items)
 for k in RANK[1:]:
-    n = gc[k] + ec[k]
+    n = gc[k] + ec[k] + grc[k]
     if n:
         gaps.append({"kind": k, "what": "%d patch exclusion(s) %s" % (n, k)})
+for i in restore_items:
+    if i["state"] == "REMOVED":
+        gaps.append({"kind": "REMOVED", "what": "rule %d must stay active but is removed by %s" % (i["rule"], ", ".join(i["by"]))})
+for i in baseline_items:
+    if not i["ok"]:
+        gaps.append({"kind": "SETTING", "what": "%s is %s (want %s) at %s" % (i["setting"], i["have"], i["want"], i["at"] or "-")})
 if E["AUD_STATE"].startswith("DRIFT"):
     gaps.append({"kind": "DRIFT", "what": "managed config hand-edited (%s)" % E["AUD_STATE"]})
 covered = not gaps
@@ -594,15 +908,155 @@ def retirable(x):
 legacy =[x for x in excl if x["source"] == "legacy"]
 managed_n = sum(1 for x in excl if x["source"] == "managed")
 
+# ---------------------------------------------------------------- retire mode (install)
+# Comment out every statement in the legacy files that the (just written)
+# managed config covers, restores, or replaces. Anything else stays active and
+# is reported. Runs after the managed files are on the Include chain.
+def stmt_id(t):
+    m = re.search(r"(?:^|,)\s*id:'?(\d+)", t[-1]) if len(t) > 1 else None
+    return int(m.group(1)) if m else None
+
+if E.get("AUD_MODE") == "retire":
+    LEG = set(E["AUD_LEGACY_FILES"].split())
+    SUP = {int(i) for i in E["AUD_SUPERSEDED"].split()}
+    RM, NM = E["AUD_RETIRE_MARK"], E["AUD_NOTE_MARK"]
+    baseline_names = {b[0].lower() for b in P_BASELINE}
+    by_stmt = {}
+    for x in excl:
+        by_stmt.setdefault((x["file"], x["line"]), []).append(x)
+    plan, kept = {}, []
+    for st in stmts:
+        f, t = st["file"], st["toks"]
+        if os.path.basename(f) not in LEG or real(f).startswith(MANAGED_REAL + os.sep) or is_crs_rule_file(f):
+            continue
+        dl, xs, why = t[0].lower(), by_stmt.get((f, st["line"]), []), None
+        if dl in ("secrule", "secaction"):
+            if st.get("_chained") or "_toks" not in st:
+                pass                                   # chain links / chained rules: never touched
+            elif stmt_id(t) in SUP:
+                why = "replaced by the patch (id %d)" % stmt_id(t)
+            elif xs and all(retirable(x) for x in xs):
+                why = "covered by the patch"
+        elif dl == "secruleremovebyid":
+            rng = id_ranges(" ".join(t[1:]))
+            if rng and all(hi - lo < 1000 for lo, hi in rng):
+                rids = [r for lo, hi in rng for r in range(lo, hi + 1)]
+                if all(r in P_RESTORE for r in rids):
+                    why = "RESTORED -- rule must stay active"
+                elif all(r in P_RESTORE or r in P_GLOBAL_REMOVE for r in rids):
+                    why = "in GLOBAL_REMOVE"
+        elif dl == "secruleupdatetargetbyid":
+            if xs and all(retirable(x) for x in xs):
+                why = "covered by the patch"
+        elif dl in baseline_names:
+            why = "baseline setting"
+        if why:
+            plan.setdefault(f, []).append((st["line"], st["end"], why, " ".join(t)[:110]))
+        elif xs:
+            kept.append((f, st["line"], " ".join(t)[:140]))
+    shift = {}
+    for f, items in sorted(plan.items()):
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        shift[f] = 0 if any(l.startswith(NM) for l in lines) else 2
+        for s, e, _, _ in items:
+            for i in range(s - 1, e):
+                if not lines[i].startswith(RM):
+                    lines[i] = RM + lines[i]
+        if not any(l.startswith(NM) for l in lines):
+            lines.insert(0, "%sStatements prefixed '%s' were moved into install-modsec-patch.sh (%s) and are no longer\n"
+                            "%sloaded. Add new exclusions to that script, not here. --uninstall restores them.\n"
+                            % (NM, RM.strip(), E["AUD_PATCH_VERSION"], NM))
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+        print("retired %d statement(s) in %s" % (len(items), f))
+        by_why = {}
+        for s, _, why, txt in items:
+            by_why.setdefault(why, []).append((s + shift[f], txt))
+        for why, its in by_why.items():
+            if len(its) <= 3:
+                for s, txt in its:
+                    print("    %-34s line %-4d %s" % (why, s, txt[:90]))
+            else:
+                print("    %-34s %d statements, lines %s" % (why, len(its), ",".join(str(s) for s, _ in its)))
+    if not plan:
+        print("retire: nothing to retire in legacy files (%s)" % " ".join(sorted(LEG)))
+    if kept:
+        print("kept active (NOT covered by the patch -- add to the script or leave):")
+        for f, n, txt in kept:
+            print("    %s:%d  %s" % (f, n + shift.get(f, 0), txt))
+    sys.exit(0)
+
+# One row per statement (file:line): a SecRuleUpdateTargetById with 15 fields or
+# a SecRule with 36 ctl: actions is one decision, so one row.
+RISKS = ["red", "yellow", "green"]
+stmt_rows = {}
+for x in legacy:
+    stmt_rows.setdefault((x["file"], x["line"]), []).append(x)
+
+def compact_ids(xs):
+    ids = sorted({lo if lo == hi else (lo, hi) for x in xs for lo, hi in (x["ranges"] or [])},
+                 key=lambda v: v if isinstance(v, int) else v[0])
+    out = [str(v) if isinstance(v, int) else "%d-%d" % v for v in ids]
+    return ",".join(out) if len(out) <= 6 else "%s ... %s (%d rules)" % (",".join(out[:4]), out[-1], len(out))
+
+def row_of(xs):
+    x0 = xs[0]
+    risk = min((x["risk"] for x in xs), key=RISKS.index)
+    kinds = {x["kind"] for x in xs}
+    scope_txt = x0["desc"].split("  ")[0]
+    if x0["kind"] == "engine":
+        what = x0["desc"]
+    elif kinds == {"target"}:
+        tg = sorted({x["target"] for x in xs})
+        tg_txt = ", ".join(tg) if len(tg) <= 3 else "%d targets" % len(tg)
+        what = "%s  remove target %s  from %s" % (scope_txt, tg_txt, compact_ids(xs))
+    elif kinds == {"rule"}:
+        what = "%s  remove rule %s" % (scope_txt, compact_ids(xs))
+    else:
+        what = "%s  %d actions (%s)" % (scope_txt, len(xs), ", ".join(sorted(kinds)))
+    n_ret = sum(1 for x in xs if retirable(x))
+    eff = all(legacy_effective(x) for x in xs)
+    crit = sorted({x["critical"] for x in xs if x["critical"]})
+    warn = sorted({x["warn"] for x in xs if x["warn"]})
+    return {"file": x0["file"], "line": x0["line"], "order": x0["order"], "risk": risk, "what": what,
+            "exclusions": len(xs), "retirable": n_ret, "effective": eff, "critical": crit, "warn": warn}
+
+rows = sorted((row_of(xs) for xs in stmt_rows.values()), key=lambda r: (RISKS.index(r["risk"]), r["order"]))
+# The patch's own whole-rule removals are deliberate but still weaken the WAF:
+# shown (red/yellow only -- the 800 field exclusions are not) so they stay visible.
+m_rows_src = {}
+for x in excl:
+    if x["source"] == "managed" and x["kind"] in ("rule", "engine"):
+        m_rows_src.setdefault((x["file"], x["line"]), []).append(x)
+m_rows = sorted((dict(row_of(xs), retirable=0) for xs in m_rows_src.values()), key=lambda r: (RISKS.index(r["risk"]), r["order"]))
+risks = []
+for r in m_rows:
+    for c in r["critical"]:
+        risks.append("%s:%d  %s  (patch, by design)" % (r["file"], r["line"], c))
+for r in rows:
+    for c in r["critical"]:
+        risks.append("%s:%d  %s" % (r["file"], r["line"], c))
+    for w in r["warn"]:
+        risks.append("%s:%d  %s" % (r["file"], r["line"], w))
+for k, (v, where) in sorted(settings.items()):
+    w = setting_warn(k, v)
+    if w:
+        risks.append("%s  %s %s -- %s" % (where, k, v, w))
+
 report = {
     "host": socket.gethostname(), "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     "latest_patch": E["AUD_PATCH_VERSION"], "latest_hash": E["AUD_PATCH_HASH"],
     "installed": E["AUD_INSTALLED"], "state": E["AUD_STATE"], "engine": engine,
     "crs": E["AUD_CRS"], "thai_fix": E["AUD_THAI"], "main_conf": MAIN, "loaded_files": loaded, "nginx_source": ngx_source,
-    "coverage": {"global": gc, "endpoints": ec,
+    "global_removals": gr_items, "restored": restore_items, "baseline": baseline_items,
+    "patch_rule_removals": [{k: r[k] for k in r if k != "order"} for r in m_rows],
+    "coverage": {"global": gc, "endpoints": ec, "global_removals": grc,
                  "global_gaps": [i for i in glob_items if i["state"] not in ("FULL", "N/A")],
                  "endpoint_items": ep_items},
-    "legacy": [dict({k: x[k] for k in ("file", "line", "risk", "kind", "desc")}, effective=legacy_effective(x), retirable=retirable(x)) for x in legacy],
+    "legacy": [{k: r[k] for k in r if k != "order"} for r in rows],
+    "settings": {k: {"value": v, "at": w, "warn": setting_warn(k, v)} for k, (v, w) in settings.items()},
+    "risks": risks,
     "managed_exclusions": managed_n, "orphans": orphans, "gaps": gaps,
     "result": "COVERED" if covered else "NOT COVERED",
 }
@@ -637,14 +1091,50 @@ for (st, rules), fields in sorted(byrules.items(), key=lambda kv: RANK.index(kv[
         src = next(i["sources"] for i in report["coverage"]["global_gaps"] if i["state"] == st and i["rule"] == rules[0] and i["field"] == fields[0])
         print("                via %s" % ", ".join(src[:3]))
 print("  endpoints %d actions:  %s" % (len(ep_items), line_counts(ec)))
+ep_shown = {}
 for i in ep_items:
-    via = "" if i["state"] in ("MISSING", "N/A") else "  via " + ", ".join(i["sources"][:2])
-    print("    %-11s %s  %s%s" % (i["state"], i["prefix"], i["action"], via))
+    if i["state"] in ("FULL", "N/A"):
+        ep_shown.setdefault((i["state"], i["prefix"]), []).append(i["action"])
+    else:
+        print("    %-11s %s  %s" % (i["state"], i["prefix"], i["action"]))
+for (st, prefix), acts in ep_shown.items():
+    print("    %-11s %s  %s" % (st, prefix, " ".join(acts) if len(acts) <= 3 else "%d actions" % len(acts)))
+print("  global removals %d rules:  %s" % (len(gr_items), line_counts(grc)))
+for i in gr_items:
+    if i["state"] not in ("FULL", "N/A"):
+        print("    %-11s %d" % (i["state"], i["rule"]))
+print("  restored (must stay active): %s" % "  ".join("%d %s" % (i["rule"], i["state"]) for i in restore_items))
+bad_base = [i for i in baseline_items if not i["ok"]]
+print("  baseline settings %d:  %s" % (len(baseline_items), "all in effect" if not bad_base else "%d NOT in effect" % len(bad_base)))
+for i in bad_base:
+    print("    SETTING     %s = %s (want %s)  %s" % (i["setting"], i["have"], i["want"], i["at"]))
 print()
-print("LEGACY EXCLUSIONS  %d (outside the managed config; %d managed exclusions not listed)" % (len(legacy), managed_n))
-for x, j in sorted(zip(legacy, report["legacy"]), key=lambda p: (["red", "yellow", "green"].index(p[0]["risk"]), p[0]["order"])):
-    flag = ("" if j["effective"] else "  [INEFFECTIVE]") + ("  [retire: covered by patch]" if j["retirable"] else "")
-    print("  %s %s:%d  %s%s" % (ICON[x["risk"]], x["file"], x["line"], x["desc"], flag))
+print("ENGINE SETTINGS  (effective value, last one loaded wins)")
+for k in SETTING_DIRECTIVES + ["tx." + s for s in TX_SETTINGS]:
+    if k in settings:
+        v, where = settings[k]
+        w = setting_warn(k, v)
+        print("  %s %-34s %-22s %s" % ("⚠️ " if w else "  ", k, v, where))
+print()
+print("PATCH WHOLE-RULE REMOVALS  %d statements (deliberate; listed so they stay visible)" % len(m_rows))
+for r in m_rows:
+    print("  %s %s:%d  %s%s" % (ICON[r["risk"]], r["file"], r["line"], r["what"], "  [see RISKS]" if r["critical"] else ""))
+print()
+print("LEGACY EXCLUSIONS  %d statements / %d exclusions (outside the managed config)" % (len(rows), len(legacy)))
+for r in rows:
+    flag = "" if r["effective"] else "  [INEFFECTIVE]"
+    if r["retirable"] == r["exclusions"]:
+        flag += "  [retire: covered by patch]"
+    elif r["retirable"]:
+        flag += "  [retire %d/%d: covered by patch]" % (r["retirable"], r["exclusions"])
+    if r["critical"] or r["warn"]:
+        flag += "  [see RISKS]"
+    print("  %s %s:%d  %s%s" % (ICON[r["risk"]], r["file"], r["line"], r["what"], flag))
+if risks:
+    print()
+    print("RISKS  (weaken the WAF for every request they match -- review each)")
+    for k in risks:
+        print("  ⚠️  %s" % k)
 if orphans:
     print()
     print("ORPHAN FILES  exclusions on disk that nothing Includes -- no effect")
@@ -727,10 +1217,110 @@ compute_status() {
   [ "$u8" -eq 0 ] && thai="applied" || thai="NOT-applied($u8)"
 }
 
+# ---- big-upload guard: write the map, find unguarded locations ---------------
+# Read-only. Walks `nginx -T` (brace-aware): a location is a GAP when it passes
+# to a backend, ModSecurity is on for it (inherited or set), its
+# client_max_body_size (own or inherited) is >= BYPASS_MIN_BYTES and nothing in
+# it routes big bodies away from body inspection (a $bypass_waf test, or
+# `SecRequestBodyAccess Off`). Returns 0 clean, 1 gaps, 2 could not run.
+body_guard_check() {
+  local dump gaps file loc bytes size
+  command -v nginx >/dev/null 2>&1 || { echo "body-guard: SKIPPED -- nginx not found"; return 2; }
+  dump="$(nginx -T 2>/dev/null || true)"
+  [ -n "$dump" ] || { echo "body-guard: SKIPPED -- nginx -T printed nothing"; return 2; }
+  gaps="$(awk -v min="$BYPASS_MIN_BYTES" '
+    function bytes(v,   n, u) {
+      if (v == "0") return 1e18
+      n = v + 0; u = tolower(substr(v, length(v)))
+      if (u == "k") n *= 1024; else if (u == "m") n *= 1048576; else if (u == "g") n *= 1073741824
+      return n
+    }
+    function guard_all(   i) { for (i = 1; i <= d; i++) grd[i] = 1 }
+    function stmt(t,   f) {
+      split(t, f, /[ \t]+/)
+      if (t ~ /bypass_waf/) guard_all()
+      if (f[1] == "client_max_body_size") big[d] = bytes(f[2])
+      else if (f[1] == "modsecurity") ms[d] = f[2]
+      else if (f[1] == "modsecurity_rules" && t ~ /SecRequestBodyAccess[ \t]+Off/) grd[d] = 1
+      else if (f[1] ~ /_pass$/) prx[d] = 1
+    }
+    /^# configuration file / { file = $4; sub(/:$/, "", file); next }
+    {
+      line = $0
+      gsub(/"[^"]*[{}][^"]*"/, "Q", line)
+      sub(/[ \t]*#.*/, "", line)
+      gsub(/\{/, "\n{\n", line); gsub(/\}/, "\n}\n", line); gsub(/;/, ";\n", line)
+      n = split(line, pc, "\n")
+      for (i = 1; i <= n; i++) {
+        t = pc[i]; gsub(/^[ \t]+|[ \t]+$/, "", t)
+        if (t == "") continue
+        if (t == "{") {
+          d++; hdr[d] = pend; pend = ""
+          ms[d] = ms[d-1]; big[d] = big[d-1]; grd[d] = 0; prx[d] = 0; src[d] = file
+          if (hdr[d] ~ /bypass_waf/) guard_all()
+        } else if (t == "}") {
+          if (d > 0) {
+            if (hdr[d] ~ /^location/ && prx[d] && ms[d] == "on" && !grd[d] && big[d] >= min)
+              printf "%s|%s|%.0f\n", src[d], hdr[d], big[d]
+            d--
+          }
+        } else if (t ~ /;$/) { sub(/;$/, "", t); stmt(t) }
+        else pend = t
+      }
+    }' <<<"$dump" | sort -u)"
+  if [ -z "$gaps" ]; then
+    echo "body-guard: OK -- no location takes >= $((BYPASS_MIN_BYTES / 1000000)) MB bodies through ModSecurity unguarded"
+    return 0
+  fi
+  while IFS='|' read -r file loc bytes; do
+    if [ "$bytes" -ge 1000000000000000000 ]; then size="unlimited"; else size="$((bytes / 1000000)) MB"; fi
+    echo "body-guard GAP: $loc  [$file]  client_max_body_size $size, modsecurity on, no guard"
+  done <<<"$gaps"
+  cat <<HINT
+body-guard fix, per gap location (map \$bypass_waf comes from $BYPASS_MAP_FILE):
+    error_page 418 = @<name>_nowaf;
+    if (\$bypass_waf) { return 418; }
+  plus a named location beside it, same proxy_pass / headers / client_max_body_size / timeouts:
+    location @<name>_nowaf {
+        modsecurity on;
+        modsecurity_rules 'SecRequestBodyAccess Off';
+        ...
+    }
+  (>= 100 MB bodies then skip body inspection; URI, headers and args are still checked.)
+HINT
+  return 1
+}
+
+# Install-time: write BYPASS_MAP_FILE unless nginx cannot load conf.d at http
+# level or something else already defines $bypass_waf (a second map is a
+# duplicate-variable error). Sets BYPASS_WRITTEN. Never fails the install: a bad
+# result shows up in nginx -t and rolls back with everything else.
+install_bypass_map() {
+  local dump other
+  dump="$(nginx -T 2>/dev/null || true)"
+  if ! grep -qE "^[[:space:]]*include[[:space:]]+$(dirname "$BYPASS_MAP_FILE")/\*" <<<"$dump"; then
+    echo "bypass map: SKIPPED -- nginx does not include $(dirname "$BYPASS_MAP_FILE")/*.conf at http level"
+    return 0
+  fi
+  other="$(awk '/^# configuration file /{f=$4; sub(/:$/,"",f)} /^[[:space:]]*map[[:space:]].*\$bypass_waf/{print f; exit}' <<<"$dump")"
+  if [ -n "$other" ] && [ "$other" != "$BYPASS_MAP_FILE" ]; then
+    echo "bypass map: SKIPPED -- \$bypass_waf is already defined in $other (delete that map and re-run to let the script own it)"
+    return 0
+  fi
+  gen_bypass_map > "$BYPASS_MAP_FILE"
+  chmod 644 "$BYPASS_MAP_FILE"
+  BYPASS_WRITTEN=1
+}
+
 if [ "${1:-}" = "--audit" ]; then
   case "${2:-}" in ""|--json) ;; *) echo "unknown option: $2 (--audit [--json])" >&2; exit 2 ;; esac
   compute_status
   rc=0; run_audit "${2:+json}" || rc=$?
+  exit "$rc"
+fi
+
+if [ "${1:-}" = "--check-body" ]; then
+  rc=0; body_guard_check || rc=$?
   exit "$rc"
 fi
 
@@ -761,12 +1351,32 @@ BAK_DIR="/var/backups/onebox-patch-$STAMP"
 mkdir -p "$BAK_DIR"
 cp -p "$MAIN_CONF" "$BAK_DIR/main.conf"
 [ -d "$MANAGED_DIR" ] && cp -rp "$MANAGED_DIR" "$BAK_DIR/managed"
+LEGACY_DIR="$(dirname "$MAIN_CONF")"
+mkdir -p "$BAK_DIR/legacy"
+BYPASS_WRITTEN=0
+[ -f "$BYPASS_MAP_FILE" ] && cp -p "$BYPASS_MAP_FILE" "$BAK_DIR/bypass-map.conf"
+for f in "${LEGACY_FILES[@]}"; do
+  [ -f "$LEGACY_DIR/$f" ] && cp -p "$LEGACY_DIR/$f" "$BAK_DIR/legacy/$f"
+done
 
-rollback() {
-  echo "nginx -t FAILED -- rolling back, nginx NOT reloaded. Backups: $BAK_DIR" >&2
+restore_backups() {
+  if [ -f "$BAK_DIR/bypass-map.conf" ]; then
+    cp -p "$BAK_DIR/bypass-map.conf" "$BYPASS_MAP_FILE"
+  elif [ "$BYPASS_WRITTEN" = 1 ]; then
+    rm -f "$BYPASS_MAP_FILE"
+  fi
   cp -p "$BAK_DIR/main.conf" "$MAIN_CONF"
   rm -rf "$MANAGED_DIR"
   [ -d "$BAK_DIR/managed" ] && cp -rp "$BAK_DIR/managed" "$MANAGED_DIR"
+  for f in "${LEGACY_FILES[@]}"; do
+    [ -f "$BAK_DIR/legacy/$f" ] && cp -p "$BAK_DIR/legacy/$f" "$LEGACY_DIR/$f"
+  done
+  return 0
+}
+
+rollback() {
+  echo "nginx -t FAILED -- rolling back, nginx NOT reloaded. Backups: $BAK_DIR" >&2
+  restore_backups
   exit 3
 }
 
@@ -781,12 +1391,22 @@ if [ "${1:-}" = "--uninstall" ]; then
   sed -i -e "\\|^${MARK_BEFORE}\$|d" -e "\\|^${MARK_AFTER}\$|d" \
          -e "\\|^${INC_BEFORE}\$|d" -e "\\|^${INC_AFTER}\$|d" "$MAIN_CONF"
   rm -rf "$MANAGED_DIR"
+  # Only our own map; a location still using $bypass_waf makes nginx -t fail and rolls back.
+  if [ -f "$BYPASS_MAP_FILE" ] && grep -qxF "$BYPASS_MARK" "$BYPASS_MAP_FILE"; then rm -f "$BYPASS_MAP_FILE"; fi
+  # Bring retired legacy statements back: the box returns to its pre-patch behavior.
+  for f in "${LEGACY_FILES[@]}"; do
+    [ -f "$LEGACY_DIR/$f" ] || continue
+    sed -i -e "/^#\\[onebox-patch note\\] /d" -e "s/^#\\[onebox-patch retired\\] //" "$LEGACY_DIR/$f"
+  done
   reload_nginx
   echo "uninstalled. backups: $BAK_DIR"
   exit 0
 fi
 
 [ -n "${1:-}" ] && { echo "unknown option: $1 (see header)" >&2; exit 2; }
+
+# Retiring legacy statements needs the audit parser.
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 not found -- install needs it (legacy retire + audit). Nothing changed." >&2; exit 1; }
 
 # ---- preflight: managed id range must be free outside the managed files ------------
 n_ep=${#ENDPOINTS[@]}
@@ -822,6 +1442,17 @@ if ! grep -qxF "$INC_AFTER" "$MAIN_CONF"; then
   sed -i -E "0,\\|${RULES_RE}|s||&\\n${MARK_AFTER}\\n${INC_AFTER}|" "$MAIN_CONF"
 fi
 
+# Comment out what the managed config now covers/replaces in the legacy files.
+compute_status
+rc=0; AUDIT_MODE=retire run_audit "" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "ERROR: retiring legacy statements failed (exit $rc) -- restoring backups, nginx NOT reloaded. Backups: $BAK_DIR" >&2
+  restore_backups
+  exit 2
+fi
+
+install_bypass_map
+
 reload_nginx
 
 echo "installed $PATCH_VERSION (was: $PREV) -- ${#RULES[@]} rules x ${#FIELDS[@]} fields, $n_ep endpoint rules"
@@ -832,4 +1463,6 @@ echo
 # (0 covered / 1 gaps / 2 audit error) becomes the script's.
 compute_status
 rc=0; run_audit "" || rc=$?
+echo
+body_guard_check || true   # warning only; --check-body returns the status
 exit "$rc"
