@@ -23,7 +23,7 @@ LABEL="onebox.verify.run"
 STATE="$HERE/state/results.json"
 EVID_ROOT="$HERE/evidence"
 
-JOURNEYS=(install-coverage bypasses legit-traffic lifecycle audit-edges body-guard)
+JOURNEYS=(install-coverage bypasses legit-traffic lifecycle audit-edges body-guard notify)
 # Which parts of install-modsec-patch.sh each journey proves. A journey is
 # re-run by `run` only when one of its parts (or its own journey file, the
 # fixtures, or this driver) changed since its last PASS.
@@ -37,6 +37,7 @@ deps_of() {
     lifecycle) echo "flow audit" ;;
     audit-edges) echo "audit flow" ;;
     body-guard) echo "data flow" ;;
+    notify) echo "flow" ;;
   esac
 }
 

@@ -42,6 +42,7 @@
 #   ./install-modsec-patch.sh --audit --json   same, one JSON object (fleet collection)
 #   ./install-modsec-patch.sh --check-body read-only: locations that take >=100 MB bodies with ModSecurity on and no guard
 #   ./install-modsec-patch.sh --print     print the generated config, change nothing
+#   (install / --uninstall also post a Thai summary to Discord; add --no-notify to skip)
 #   ./install-modsec-patch.sh --uninstall remove the managed files + Include lines
 #   MODSEC_MAIN_CONF=... CRS_RULES_DIR=... ./install-modsec-patch.sh   (override detection)
 #
@@ -57,6 +58,13 @@
 # removes them. A location it cannot copy safely (proxy_pass with a URI,
 # limit_except, modsecurity off) is left alone and reported. --check-body lists
 # every location that takes >= 100 MB through ModSecurity with no guard.
+#
+# Discord notification (PV-2026-10-31): an install or --uninstall run posts a Thai
+# summary card (VM, old -> new Patch Version, CHANGELOG line, coverage, vhost
+# guard, body-guard, backup path) to the webhook install-alerting.sh saved in
+# /etc/fail2ban/jail.d/modsec-alert.local. Sent on success AND on failure/rollback.
+# Never changes the exit code and never waits more than 5 s. No webhook = skipped.
+# Off: --no-notify or ONEBOX_NO_NOTIFY=1. Test hook: ONEBOX_NOTIFY_WEBHOOK=<url>.
 #
 # If `nginx -t` fails, every touched file is restored and nginx is not reloaded.
 # Install prints what changed vs the previously installed version, then runs
@@ -77,7 +85,7 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-30"
+PATCH_VERSION="PV-2026-10-31"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
@@ -86,6 +94,7 @@ CHANGELOG=(
   "PV-2026-10-28  Big-upload guard: manages the nginx http-level \$bypass_waf map (conf.d/onebox-waf-bypass.conf); --check-body and an install-time warning list locations with modsecurity on, client_max_body_size >= 100 MB and no body guard (EXTEEM-106 nginx OOM, 4 GB rclone PUT, task t_1793008028). No change to exclusions or baseline."
   "PV-2026-10-29  Install also applies the guard to BYPASS_LOCATIONS (/business-drive/): error_page 418 + if (\$bypass_waf) in the location and a generated @<name>_nowaf named location (SecRequestBodyAccess Off), marker-delimited, backed up, removed by --uninstall. Locations it cannot copy safely are reported, not edited. No change to exclusions or baseline."
   "PV-2026-10-30  /business-drive/: 934190 (SSRF, scheme-less localhost) excluded on ARGS:json.icons.array_0..9.src only -- a PUT of a web-app manifest.json whose icon URL is http://localhost/... scored 15 and was blocked (ONEBOX-TRONEX-01, unique_id 179316468594.863633). 934190 stays active everywhere else and on every other field."
+  "PV-2026-10-31  Install and --uninstall post a Thai summary to Discord (webhook from install-alerting.sh; success, failure and rollback; --no-notify to skip; never changes the exit code). No change to exclusions or baseline."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -1168,6 +1177,145 @@ PY_AUDIT
   return "$rc"
 }
 
+# ---- Discord notification (install / --uninstall) -------------------------------
+NOTIFY_ON=1; [ "${ONEBOX_NO_NOTIFY:-0}" = 1 ] && NOTIFY_ON=0
+_args=()
+for _a in "$@"; do
+  if [ "$_a" = "--no-notify" ]; then NOTIFY_ON=0; else _args+=("$_a"); fi
+done
+set -- "${_args[@]+"${_args[@]}"}"
+
+NOTIFY_MODE=""; NOTIFY_LOG=""; NOTIFY_OLD_PV="none"; NOTIFY_PIDS=""
+notify_webhook() {
+  local h="${ONEBOX_NOTIFY_WEBHOOK:-}"
+  if [ -z "$h" ] && [ -r /etc/fail2ban/jail.d/modsec-alert.local ]; then
+    h="$(grep -hoP '^\s*discord_webhook\s*=\s*\K\S+' /etc/fail2ban/jail.d/modsec-alert.local 2>/dev/null | head -1 || true)"
+  fi
+  case "$h" in http://*|https://*) echo "$h" ;; esac
+}
+
+# Starts copying stdout/stderr into a log; notify_finish (EXIT trap) reads it.
+notify_start() {
+  [ "$NOTIFY_ON" = 1 ] || return 0
+  NOTIFY_MODE="$1"
+  [ -f "$MANAGED_DIR/VERSION" ] && NOTIFY_OLD_PV="$(awk '{print $1}' "$MANAGED_DIR/VERSION")"
+  NOTIFY_LOG="$(mktemp)"
+  exec 3>&1 4>&2
+  exec > >(tee -a "$NOTIFY_LOG") 2> >(tee -a "$NOTIFY_LOG" >&2)
+  trap notify_finish EXIT
+}
+
+notify_finish() {
+  local rc=$? hook payload resp code cur cl e
+  set +e
+  trap - EXIT
+  exec 1>&3 2>&4 3>&- 4>&-
+  sleep 0.3                      # let both tee processes drain
+  hook="$(notify_webhook)"
+  if [ -z "$hook" ]; then
+    echo "แจ้ง Discord: ข้าม — ไม่พบ webhook (ยังไม่ได้รัน install-alerting.sh บนเครื่องนี้)"
+  elif ! command -v python3 >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    echo "แจ้ง Discord: ข้าม — ไม่พบ python3 หรือ curl"
+  else
+    cl=""
+    for e in "${CHANGELOG[@]}"; do
+      case "$e" in "$PATCH_VERSION "*) cl="${e#"$PATCH_VERSION"}"; cl="${cl#"${cl%%[![:space:]]*}"}" ;; esac
+    done
+    payload="$(mktemp)"; resp="$(mktemp)"; chmod 600 "$payload"
+    NT_LOG="$NOTIFY_LOG" NT_RC="$rc" NT_MODE="$NOTIFY_MODE" NT_OLD="$NOTIFY_OLD_PV" NT_NEW="$PATCH_VERSION" \
+    NT_CHANGELOG="$cl" NT_HOST="$(hostname)" NT_BAK="${BAK_DIR:-}" \
+    NT_PUBLIC_IP="$(cat /etc/modsec-alert-public-ip 2>/dev/null || echo unknown)" NT_TS="$(date '+%d/%b/%Y:%H:%M:%S %z')" \
+    python3 - >"$payload" <<'PY_NOTIFY'
+import json, os, re
+
+E = os.environ
+RED, GRN, YEL, CYN, GRY, RST = ("\u001b[1;31m", "\u001b[1;32m", "\u001b[1;33m", "\u001b[1;36m", "\u001b[2;37m", "\u001b[0m")
+EQ, DA = "═" * 36, "─" * 36
+rc, mode = int(E["NT_RC"]), E["NT_MODE"]
+log = open(E["NT_LOG"], encoding="utf-8", errors="replace").read()
+lines = [l.rstrip() for l in log.splitlines()]
+installed = any(l.startswith("installed PV-") for l in lines)
+
+if mode == "uninstall":
+    if rc == 0: color, icon, title = YEL, "↩️", "ถอนการติดตั้ง Patch แล้ว"
+    else:       color, icon, title = RED, "❌", "ถอนการติดตั้งไม่สำเร็จ"
+elif rc == 0:   color, icon, title = GRN, "✅", "ติดตั้ง Patch สำเร็จ — ครอบคลุมครบ"
+elif rc == 1 and installed: color, icon, title = YEL, "⚠️", "ติดตั้งแล้ว แต่ยังมีช่องว่าง (Coverage)"
+elif rc == 1:   color, icon, title = RED, "❌", "ติดตั้งไม่สำเร็จ — ยังไม่มีอะไรเปลี่ยน"
+elif rc == 2:   color, icon, title = RED, "❌", "ติดตั้งไม่สำเร็จ — คืนค่าจาก backup แล้ว (nginx ไม่ถูก reload)"
+elif rc == 3:   color, icon, title = RED, "❌", "nginx -t ไม่ผ่าน — rollback แล้ว (nginx ไม่ถูก reload)"
+else:           color, icon, title = RED, "❌", "สคริปต์จบด้วยรหัส %d" % rc
+
+old, new = E["NT_OLD"], E["NT_NEW"]
+if mode == "uninstall":
+    ver = "%s → ถอนออก" % old
+elif installed and old == new:
+    ver = "%s (ติดตั้งซ้ำ เวอร์ชันเดิม)" % new
+elif installed or rc == 0:
+    ver = "%s → %s" % (old, new)
+elif old == new:
+    ver = "%s (ไม่มีการเปลี่ยนแปลง)" % new
+else:
+    ver = "%s (สคริปต์นี้: %s)" % (old, new)
+
+out = ["%s%s ModSec Patch — %s%s" % (color, icon, title, RST), GRY + EQ + RST,
+       "📅 %sวันที่/เวลา%s  : %s" % (CYN, RST, E["NT_TS"]),
+       "🖥️  %sโฮสต์ (VM)%s   : %s" % (CYN, RST, E["NT_HOST"]),
+       "🌐 %sPublic IP%s    : %s%s%s" % (CYN, RST, GRN, E["NT_PUBLIC_IP"], RST),
+       "🏷️  %sPatch Version%s: %s%s%s" % (CYN, RST, YEL, ver, RST),
+       "🔢 %sExit code%s    : %d" % (CYN, RST, rc)]
+
+if mode != "uninstall" and E["NT_CHANGELOG"] and (installed or rc == 0):
+    out += [GRY + DA + RST, "📝 สิ่งที่เปลี่ยนใน %s" % new, "   " + E["NT_CHANGELOG"][:420]]
+
+det = []
+for l in lines:
+    if l.startswith("RESULT: COVERED"):
+        det.append("%s✔%s Coverage: ครอบคลุมครบทุก exclusion ของ Patch" % (GRN, RST))
+    elif l.startswith("RESULT: NOT COVERED"):
+        det.append("%s✘%s Coverage: ยังไม่ครอบคลุม" % (RED, RST))
+    elif re.match(r"^  - \[", l):
+        det.append("   " + RED + l.strip()[:160] + RST)
+    elif l.startswith("bypass map: SKIPPED"):
+        det.append("%s•%s map $bypass_waf: ข้าม — %s" % (YEL, RST, l.split("--", 1)[-1].strip()[:160]))
+    elif l.startswith("vhost guard:"):
+        t = l[len("vhost guard:"):].strip()
+        m = re.match(r"ADDED (\S+) in (\S+)", t)
+        if m: det.append("%s✔%s vhost guard: เพิ่มที่ %s (%s)" % (GRN, RST, m.group(1), m.group(2)))
+        elif t.startswith("already guarded"): det.append("%s✔%s vhost guard: %s" % (GRN, RST, t.replace("already guarded", "มี guard อยู่แล้ว", 1)[:160]))
+        elif "SKIPPED" in t: det.append("%s•%s vhost guard: ข้าม %s" % (YEL, RST, t.replace("SKIPPED", "", 1).strip()[:200]))
+        elif "not found" in t: det.append("%s•%s vhost guard: ไม่พบ location %s" % (YEL, RST, t.split(" not found")[0].strip()))
+        else: det.append("%s•%s vhost guard: %s" % (YEL, RST, t[:160]))
+    elif l.startswith("body-guard: OK"):
+        det.append("%s✔%s body-guard: ไม่มี location ที่รับ body ≥ 100 MB ผ่าน ModSecurity โดยไม่มี guard" % (GRN, RST))
+    elif l.startswith("body-guard GAP"):
+        det.append("%s⚠%s %s" % (RED, RST, l[:200]))
+    elif l.startswith("ERROR:") or l.startswith("nginx -t FAILED"):
+        det.append("%s✘ %s%s" % (RED, l[:220], RST))
+if det:
+    out += [GRY + DA + RST, "📋 รายละเอียด"] + det
+if E["NT_BAK"]:
+    out += [GRY + DA + RST, "💾 Backup: %s" % E["NT_BAK"]]
+out.append(GRY + EQ + RST)
+
+msg = "\n".join(out)
+if len(msg) > 1850:
+    msg = msg[:1850].rstrip() + "\n…(ข้อความถูกตัด)"
+print(json.dumps({"content": "```ansi\n%s\n```" % msg}))
+PY_NOTIFY
+    code="$(curl -sS -o "$resp" -w '%{http_code}' -m 5 -X POST -H 'Content-Type: application/json' --data-binary @"$payload" "$hook" 2>/dev/null)"
+    cur=$?
+    if [ "$cur" -eq 0 ] && [ "$code" = 204 ]; then
+      echo "แจ้ง Discord: ส่งแล้ว (HTTP $code)"
+    else
+      echo "แจ้ง Discord: ไม่สำเร็จ (curl=$cur http=${code:-none}) — ไม่กระทบผลการติดตั้ง"
+    fi
+    rm -f "$payload" "$resp"
+  fi
+  rm -f "$NOTIFY_LOG"
+  exit "$rc"
+}
+
 if [ "${1:-}" = "--print" ]; then
   echo "### $MANAGED_DIR/before-crs.conf"; gen_before
   echo; echo "### $MANAGED_DIR/after-crs.conf"; gen_after
@@ -1470,6 +1618,12 @@ if [ "${1:-}" = "--status" ]; then
   echo "ONEBOX_PATCH host=$(hostname) installed=$inst_pv state=$state hash=$(installed_hash) crs=${crs:-unknown} thai_fix=$thai legacy_exclusion_lines=$legacy"
   exit 0
 fi
+
+# install and --uninstall report to Discord (unknown options do not).
+case "${1:-}" in
+  "") notify_start install ;;
+  --uninstall) notify_start uninstall ;;
+esac
 
 # A config that already fails would make the rollback below blame this patch.
 if ! nginx -t >/dev/null 2>&1; then
