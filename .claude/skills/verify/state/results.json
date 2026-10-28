@@ -1,50 +1,50 @@
 {
   "audit-edges": {
-    "at": "2026-10-28T04:28:07Z",
+    "at": "2026-10-28T04:50:25Z",
     "checks": "12",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/audit-edges.log",
-    "fingerprint": "876f602c801c",
-    "head_commit": "f25fa8c",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/audit-edges.log",
+    "fingerprint": "a0c2b1faf08e",
+    "head_commit": "67bccf7",
     "result": "PASS"
   },
   "body-guard": {
-    "at": "2026-10-28T04:28:28Z",
-    "checks": "16",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/body-guard.log",
-    "fingerprint": "add1539a3ba6",
-    "head_commit": "f25fa8c",
+    "at": "2026-10-28T04:50:55Z",
+    "checks": "30",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/body-guard.log",
+    "fingerprint": "95ce57cfa88e",
+    "head_commit": "67bccf7",
     "result": "PASS"
   },
   "bypasses": {
-    "at": "2026-10-28T04:27:30Z",
+    "at": "2026-10-28T04:49:48Z",
     "checks": "7",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/bypasses.log",
-    "fingerprint": "44cc5646b2c5",
-    "head_commit": "f25fa8c",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/bypasses.log",
+    "fingerprint": "0b32759a9c13",
+    "head_commit": "67bccf7",
     "result": "PASS"
   },
   "install-coverage": {
-    "at": "2026-10-28T04:27:25Z",
+    "at": "2026-10-28T04:49:42Z",
     "checks": "14",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/install-coverage.log",
-    "fingerprint": "1b59987795f8",
-    "head_commit": "f25fa8c",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/install-coverage.log",
+    "fingerprint": "8e2330a1d377",
+    "head_commit": "67bccf7",
     "result": "PASS"
   },
   "legit-traffic": {
-    "at": "2026-10-28T04:27:37Z",
+    "at": "2026-10-28T04:49:54Z",
     "checks": "11",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/legit-traffic.log",
-    "fingerprint": "cbe3c140b059",
-    "head_commit": "f25fa8c",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/legit-traffic.log",
+    "fingerprint": "19a1119241b4",
+    "head_commit": "67bccf7",
     "result": "PASS"
   },
   "lifecycle": {
-    "at": "2026-10-28T04:27:59Z",
+    "at": "2026-10-28T04:50:17Z",
     "checks": "22",
-    "evidence": ".claude/skills/verify/evidence/20261028-112719/lifecycle.log",
-    "fingerprint": "f7c516b869c3",
-    "head_commit": "f25fa8c",
+    "evidence": ".claude/skills/verify/evidence/20261028-114936/lifecycle.log",
+    "fingerprint": "cfccb25676e8",
+    "head_commit": "67bccf7",
     "result": "PASS"
   }
 }

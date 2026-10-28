@@ -45,12 +45,18 @@
 #   ./install-modsec-patch.sh --uninstall remove the managed files + Include lines
 #   MODSEC_MAIN_CONF=... CRS_RULES_DIR=... ./install-modsec-patch.sh   (override detection)
 #
-# Big-upload guard (PV-2026-10-28): with `modsecurity on` the connector spools
+# Big-upload guard (PV-2026-10-29): with `modsecurity on` the connector spools
 # the whole body and libmodsecurity then reads it into RAM (~2x its size), so a
-# multi-GB PUT OOM-kills nginx. Install also writes BYPASS_MAP_FILE (the
-# $bypass_waf map: Content-Length >= 9 digits, or chunked). A location opts in
-# by hand (vhosts are never edited) -- see print_bypass_hint; --check-body and
-# the end of install list the locations that still have no guard.
+# multi-GB PUT OOM-kills nginx. Install therefore (1) writes BYPASS_MAP_FILE
+# (the $bypass_waf map: Content-Length >= 9 digits, or chunked) and (2) adds the
+# guard to every BYPASS_LOCATIONS location it finds in the nginx config: an
+# `error_page 418` + `if ($bypass_waf)` at the top of the location and a named
+# location `@<name>_nowaf` right after it (copy of the block, with
+# `modsecurity_rules 'SecRequestBodyAccess Off'`). Edited files are backed up,
+# the added lines carry "# onebox-patch: guard begin/end" markers, --uninstall
+# removes them. A location it cannot copy safely (proxy_pass with a URI,
+# limit_except, modsecurity off) is left alone and reported. --check-body lists
+# every location that takes >= 100 MB through ModSecurity with no guard.
 #
 # If `nginx -t` fails, every touched file is restored and nginx is not reloaded.
 # Install prints what changed vs the previously installed version, then runs
@@ -71,13 +77,14 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-28"
+PATCH_VERSION="PV-2026-10-29"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
   "PV-2026-10-15  FIELDS += json.data.array_0..9.file_path_real (POST /onebox-centrifugo/api/publish, 932370 on Thai cost-estimate path, unique_id 179207345281.765841, EXTEEM-106)."
   "PV-2026-10-16  Takes over the legacy files (sec_actions / sec_rule_removal / sec_base_modsecurity_disable): BASELINE + GLOBAL_REMOVE + their endpoint rules, legacy statements retired. Security fixes (bypasses confirmed live, libmodsecurity 3.0.17 / CRS 4.29): /onlyofficeds/ 949110 removal no longer matchable from the query string of any URL (REQUEST_URI @rx -> REQUEST_FILENAME prefix, normalized); valid JSON padded past the 128K no-files limit skipped inspection -- closed by restoring 200002 (denies over-limit bodies under ProcessPartial), NoFilesLimit 128K -> 1M; ProcessPartial kept so >13 MB raw PUTs still pass (multipart >13 MB now 400); 200002-200005 restored (body parse / multipart / engine-error checks). All URI-scoped exclusions in the managed config are path-normalized; legacy statements the patch does not cover stay as they were (install prints them)."
   "PV-2026-10-28  Big-upload guard: manages the nginx http-level \$bypass_waf map (conf.d/onebox-waf-bypass.conf); --check-body and an install-time warning list locations with modsecurity on, client_max_body_size >= 100 MB and no body guard (EXTEEM-106 nginx OOM, 4 GB rclone PUT, task t_1793008028). No change to exclusions or baseline."
+  "PV-2026-10-29  Install also applies the guard to BYPASS_LOCATIONS (/business-drive/): error_page 418 + if (\$bypass_waf) in the location and a generated @<name>_nowaf named location (SecRequestBodyAccess Off), marker-delimited, backed up, removed by --uninstall. Locations it cannot copy safely are reported, not edited. No change to exclusions or baseline."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -282,6 +289,8 @@ gen_before() {
 BYPASS_MAP_FILE="/etc/nginx/conf.d/onebox-waf-bypass.conf"
 BYPASS_MIN_DIGITS=9
 BYPASS_MIN_BYTES=100000000
+# Locations (exact prefix as written in `location`) that get the guard on install.
+BYPASS_LOCATIONS=("/business-drive/")
 BYPASS_MARK="# onebox-patch: nginx http-level map -- managed by install-modsec-patch.sh"
 
 gen_bypass_map() {
@@ -1291,6 +1300,124 @@ HINT
   return 1
 }
 
+# Add the guard to every BYPASS_LOCATIONS location found in the nginx config.
+# Needs python3 and a loaded $bypass_waf map. Edited files are copied to
+# $BAK_DIR/vhosts (MANIFEST "original|backup") for restore_backups. Prints one
+# line per location: ADDED / already guarded / SKIPPED (reason). Non-zero = crash.
+apply_bypass_locations() {
+  local dump rc=0
+  dump="$(mktemp)"
+  nginx -T >"$dump" 2>/dev/null || : >"$dump"
+  if ! grep -qE '^[[:space:]]*map[[:space:]].*\$bypass_waf' "$dump"; then
+    echo "vhost guard: SKIPPED -- no \$bypass_waf map is loaded (see bypass map line above)"
+    rm -f "$dump"; return 0
+  fi
+  BG_DUMP="$dump" BG_BAK="$BAK_DIR/vhosts" BG_LOCS="${BYPASS_LOCATIONS[*]}" BG_MANAGED="$BYPASS_MAP_FILE" \
+  python3 - <<'PY_GUARD' || rc=$?
+import os, re, shutil, sys
+
+dump, bak, managed = os.environ["BG_DUMP"], os.environ["BG_BAK"], os.environ["BG_MANAGED"]
+prefixes = os.environ["BG_LOCS"].split()
+BEGIN = "# onebox-patch: guard begin (>= 100 MB bodies skip body inspection; install-modsec-patch.sh)"
+END = "# onebox-patch: guard end"
+
+text = open(dump, encoding="utf-8", errors="replace").read()
+files = []
+for m in re.finditer(r"^# configuration file (.+):$", text, re.M):
+    if m.group(1) not in files and m.group(1) != managed:
+        files.append(m.group(1))
+
+def code(line):
+    return re.sub(r"\s#.*$|^\s*#.*$", "", line)
+
+def slug(prefix):
+    return re.sub(r"[^A-Za-z0-9]+", "_", prefix).strip("_") + "_nowaf"
+
+def backup(path):
+    os.makedirs(bak, exist_ok=True)
+    b = os.path.join(bak, path.replace("/", "%"))
+    shutil.copy2(path, b)
+    with open(os.path.join(bak, "MANIFEST"), "a") as fh:
+        fh.write("%s|%s\n" % (path, b))
+
+def process(path, prefix):
+    try:
+        src = open(path, encoding="utf-8").read()
+    except OSError:
+        return
+    lines = src.split("\n")
+    hdr = re.compile(r"^(\s*)location\s+(?:(?:=|\^~)\s+)?%s\s*\{\s*(?:#.*)?$" % re.escape(prefix))
+    out, i, changed = [], 0, False
+    name = "@" + slug(prefix)
+    while i < len(lines):
+        m = hdr.match(lines[i])
+        if not m:
+            out.append(lines[i]); i += 1; continue
+        hind, depth, j = m.group(1), 0, i
+        while j < len(lines):
+            c = re.sub(r'"[^"]*"|\'[^\']*\'', "", code(lines[j]))
+            depth += c.count("{") - c.count("}")
+            if depth <= 0:
+                break
+            j += 1
+        if j >= len(lines):
+            print("vhost guard: SKIPPED %s in %s -- unbalanced braces" % (prefix, path))
+            out.extend(lines[i:]); i = len(lines); break
+        body = lines[i + 1:j]
+        btxt = "\n".join(code(l) for l in body)
+        why = None
+        if "bypass_waf" in btxt:
+            print("vhost guard: already guarded %s in %s" % (prefix, path)); why = "done"
+        elif re.search(r"location\s+%s\b" % re.escape(name), text):
+            why = "a location %s already exists" % name
+        elif re.search(r"^\s*modsecurity\s+off\s*;", btxt, re.M):
+            why = "modsecurity is off there"
+        elif not re.search(r"^\s*proxy_pass\s", btxt, re.M):
+            why = "no proxy_pass"
+        elif re.search(r"^\s*limit_except\b", btxt, re.M):
+            why = "limit_except cannot be copied into a named location -- add the guard by hand"
+        else:
+            pp = re.search(r"^\s*proxy_pass\s+(?:https?://)?[^/\s;]+(/[^\s;]*)?\s*;", btxt, re.M)
+            if pp and pp.group(1):
+                why = "proxy_pass has a URI part (named locations cannot) -- add the guard by hand"
+        if why:
+            if why != "done":
+                print("vhost guard: SKIPPED %s in %s -- %s" % (prefix, path, why))
+            out.extend(lines[i:j + 1]); i = j + 1; continue
+        ind = re.match(r"\s*", body[0]).group(0) if body and body[0].strip() else hind + "    "
+        out.append(lines[i])
+        out += [ind + BEGIN, ind + "error_page 418 = %s;" % name,
+                ind + "if ($bypass_waf) { return 418; }", ind + END]
+        out.extend(body)
+        out.append(lines[j])
+        out += [hind + BEGIN, hind + "location %s {" % name,
+                ind + "modsecurity on;", ind + "modsecurity_rules 'SecRequestBodyAccess Off';"]
+        out.extend(l for l in body if not re.match(r"^\s*modsecurity\s+(on|off)\s*;", code(l)))
+        out += [hind + "}", hind + END]
+        print("vhost guard: ADDED %s in %s (named location %s)" % (prefix, path, name))
+        changed = True
+        i = j + 1
+    if changed:
+        backup(path)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out))
+
+for prefix in prefixes:
+    found = False
+    for path in files:
+        try:
+            if re.search(r"^\s*location\s+(?:(?:=|\^~)\s+)?%s\s*\{" % re.escape(prefix), open(path, encoding="utf-8").read(), re.M):
+                found = True
+                process(path, prefix)
+        except OSError:
+            pass
+    if not found:
+        print("vhost guard: %s not found in the nginx config -- nothing to guard" % prefix)
+PY_GUARD
+  rm -f "$dump"
+  return "$rc"
+}
+
 # Install-time: write BYPASS_MAP_FILE unless nginx cannot load conf.d at http
 # level or something else already defines $bypass_waf (a second map is a
 # duplicate-variable error). Sets BYPASS_WRITTEN. Never fails the install: a bad
@@ -1360,6 +1487,9 @@ for f in "${LEGACY_FILES[@]}"; do
 done
 
 restore_backups() {
+  if [ -f "$BAK_DIR/vhosts/MANIFEST" ]; then
+    while IFS='|' read -r orig bk; do cp -p "$bk" "$orig"; done < "$BAK_DIR/vhosts/MANIFEST"
+  fi
   if [ -f "$BAK_DIR/bypass-map.conf" ]; then
     cp -p "$BAK_DIR/bypass-map.conf" "$BYPASS_MAP_FILE"
   elif [ "$BYPASS_WRITTEN" = 1 ]; then
@@ -1391,6 +1521,12 @@ if [ "${1:-}" = "--uninstall" ]; then
   sed -i -e "\\|^${MARK_BEFORE}\$|d" -e "\\|^${MARK_AFTER}\$|d" \
          -e "\\|^${INC_BEFORE}\$|d" -e "\\|^${INC_AFTER}\$|d" "$MAIN_CONF"
   rm -rf "$MANAGED_DIR"
+  # Guard blocks this script added to vhosts (backed up, restorable).
+  mkdir -p "$BAK_DIR/vhosts"
+  for f in $(grep -rlF "# onebox-patch: guard begin" /etc/nginx 2>/dev/null || true); do
+    b="$BAK_DIR/vhosts/$(echo "$f" | tr / %)"; cp -p "$f" "$b"; echo "$f|$b" >> "$BAK_DIR/vhosts/MANIFEST"
+    sed -i '/# onebox-patch: guard begin/,/# onebox-patch: guard end/d' "$f"
+  done
   # Only our own map; a location still using $bypass_waf makes nginx -t fail and rolls back.
   if [ -f "$BYPASS_MAP_FILE" ] && grep -qxF "$BYPASS_MARK" "$BYPASS_MAP_FILE"; then rm -f "$BYPASS_MAP_FILE"; fi
   # Bring retired legacy statements back: the box returns to its pre-patch behavior.
@@ -1452,6 +1588,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 install_bypass_map
+apply_bypass_locations || { echo "ERROR: applying the vhost guard failed -- restoring backups, nginx NOT reloaded. Backups: $BAK_DIR" >&2; restore_backups; exit 2; }
 
 reload_nginx
 
