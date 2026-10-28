@@ -19,6 +19,11 @@ journey_legit_traffic() {
   check "check_duplicate_inbox Doc_remark1 SQL-ish text (942100 excluded)" 200 "$(http -H 'Content-Type: application/json' -d "$sq" http://localhost:8080/onebox_uploads/api/check_duplicate_inbox)"
   check "  control: same body on another endpoint is blocked (exclusion is scoped)" 403 "$(http -H 'Content-Type: application/json' -d "$sq" http://localhost:8080/api/v2/other)"
   check "business-drive octet-stream PUT 20MB (rclone/WebDAV)" 200 "$(http -X PUT -H 'Content-Type: application/octet-stream' --data-binary @/tmp/20m.bin http://localhost:8080/business-drive/f/x.bin)"
+  # 934190 alone scores 5 (< 7); two icon URLs = 10, so the exclusion decides 200 vs 403.
+  local mf='{"icons":[{"src":"http://localhost/a/logo.png"},{"src":"http://localhost/b/logo.png"}]}'
+  check "business-drive PUT manifest.json with localhost icon URL (934190)" 200 "$(http -X PUT -H 'Content-Type: application/json' -d "$mf" http://localhost:8080/business-drive/i/admin/manifest.json)"
+  check "  control: same body on another endpoint is blocked (934190 exclusion is scoped)" 403 "$(http -X PUT -H 'Content-Type: application/json' -d "$mf" http://localhost:8080/api/v2/other)"
+  check "  control: SSRF value in another business-drive field is still blocked" 403 "$(http -X PUT -H 'Content-Type: application/json' -d '{"url":"http://localhost/a","u2":"http://localhost/b"}' http://localhost:8080/business-drive/i/x.json)"
   check "multipart upload 2MB" 200 "$(http -F file=@/tmp/2m.bin http://localhost:8080/api/v2/upload)"
   check "multipart upload 20MB denied (>13MB, by design PV-2026-10-16)" '!200' "$(http -F file=@/tmp/20m.bin http://localhost:8080/api/v2/upload)"
 }

@@ -77,7 +77,7 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-29"
+PATCH_VERSION="PV-2026-10-30"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
@@ -85,6 +85,7 @@ CHANGELOG=(
   "PV-2026-10-16  Takes over the legacy files (sec_actions / sec_rule_removal / sec_base_modsecurity_disable): BASELINE + GLOBAL_REMOVE + their endpoint rules, legacy statements retired. Security fixes (bypasses confirmed live, libmodsecurity 3.0.17 / CRS 4.29): /onlyofficeds/ 949110 removal no longer matchable from the query string of any URL (REQUEST_URI @rx -> REQUEST_FILENAME prefix, normalized); valid JSON padded past the 128K no-files limit skipped inspection -- closed by restoring 200002 (denies over-limit bodies under ProcessPartial), NoFilesLimit 128K -> 1M; ProcessPartial kept so >13 MB raw PUTs still pass (multipart >13 MB now 400); 200002-200005 restored (body parse / multipart / engine-error checks). All URI-scoped exclusions in the managed config are path-normalized; legacy statements the patch does not cover stay as they were (install prints them)."
   "PV-2026-10-28  Big-upload guard: manages the nginx http-level \$bypass_waf map (conf.d/onebox-waf-bypass.conf); --check-body and an install-time warning list locations with modsecurity on, client_max_body_size >= 100 MB and no body guard (EXTEEM-106 nginx OOM, 4 GB rclone PUT, task t_1793008028). No change to exclusions or baseline."
   "PV-2026-10-29  Install also applies the guard to BYPASS_LOCATIONS (/business-drive/): error_page 418 + if (\$bypass_waf) in the location and a generated @<name>_nowaf named location (SecRequestBodyAccess Off), marker-delimited, backed up, removed by --uninstall. Locations it cannot copy safely are reported, not edited. No change to exclusions or baseline."
+  "PV-2026-10-30  /business-drive/: 934190 (SSRF, scheme-less localhost) excluded on ARGS:json.icons.array_0..9.src only -- a PUT of a web-app manifest.json whose icon URL is http://localhost/... scored 15 and was blocked (ONEBOX-TRONEX-01, unique_id 179316468594.863633). 934190 stays active everywhere else and on every other field."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -226,8 +227,13 @@ for _r in 951100 951110 951120 951130 951140 951150 951160 951170 951180 951190 
           950100 950110 950120 950130 950140 950150 950160 950170 950180 950190; do
   DATALEAK_OFF+="${DATALEAK_OFF:+ }ruleRemoveById=$_r"
 done
+# 934190 on icon URLs inside an uploaded manifest.json (PV-2026-10-30).
+MANIFEST_ICON_OFF=""
+for _i in 0 1 2 3 4 5 6 7 8 9; do
+  MANIFEST_ICON_OFF+="${MANIFEST_ICON_OFF:+ }ruleRemoveTargetById=934190;ARGS:json.icons.array_${_i}.src"
+done
 ENDPOINTS=(
-  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME ruleRemoveById=920420 ruleRemoveById=930130"
+  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME ruleRemoveById=920420 ruleRemoveById=930130 $MANIFEST_ICON_OFF"
   "/onebox_uploads/api/check_duplicate_inbox|ruleRemoveTargetById=942100;ARGS:json.header_info.Doc_remark1 ruleRemoveTargetById=942100;ARGS:json.header_info.BuyerLineTwo"
   # legacy 900210, scope FIXED (was REQUEST_URI @rx, matchable from any query
   # string). 949110 = blocking off for OnlyOffice itself -- FP follow-up open.
