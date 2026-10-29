@@ -85,7 +85,7 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-32"
+PATCH_VERSION="PV-2026-10-33"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
@@ -96,6 +96,7 @@ CHANGELOG=(
   "PV-2026-10-30  /business-drive/: 934190 (SSRF, scheme-less localhost) excluded on ARGS:json.icons.array_0..9.src only -- a PUT of a web-app manifest.json whose icon URL is http://localhost/... scored 15 and was blocked (ONEBOX-TRONEX-01, unique_id 179316468594.863633). 934190 stays active everywhere else and on every other field."
   "PV-2026-10-31  Install and --uninstall post a Thai summary to Discord (webhook from install-alerting.sh; success, failure and rollback; --no-notify to skip; never changes the exit code). No change to exclusions or baseline."
   "PV-2026-10-32  /business-drive/: 934190 (SSRF, scheme-less localhost) excluded as a whole rule, replacing the PV-2026-10-30 per-field list (ARGS:json.icons.array_N.src). The same manifest.json PUT was blocked again on json.start_url (score 10, ONEBOX-TRONEX-01, unique_id 17931716122.060266); a manifest has many URL fields (start_url, scope, id, shortcuts...). 934190 stays active on every other path."
+  "PV-2026-10-33  RULES += 932235 (Unix command injection, command without evasion; sibling of 932230/932250 already excluded). POST /api/v2/activity blocked on ARGS:json.path_file, filename \"... Dust Line SAN1-24A401 & Replace Gasket ...xlsx\" (score 10, Onebox-Dedicate, unique_id 179324375291.259745). Global rather than endpoint-scoped: score 10 from one rule = likely a second field hit (same rule counted per matched ARGS), and the same rule blocked savefile_for_inbox (t_1792079201). No change to baseline or ENDPOINTS."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -204,7 +205,7 @@ NOTE_MARK="#[onebox-patch note] "
 RULES=(
   200002
   920230 920240 920270 920271 920272 920273
-  932120 932125 932230 932250 932330 932340 932370 932380
+  932120 932125 932230 932235 932250 932330 932340 932370 932380
   933100 933110 933120 933130 933140 933151 933160 933180
   941100 941101 941120
   942100 942101 942140 942151 942190 942290

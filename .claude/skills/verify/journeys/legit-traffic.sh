@@ -12,6 +12,10 @@ journey_legit_traffic() {
   check "WebDAV PROPFIND (allowed methods)" 200 "$(http -X PROPFIND http://localhost:8080/business-drive/folder/)"
   check "OnlyOffice parentOrigin URL (934110)" 200 "$(http 'http://localhost:8080/onlyofficeds/web-apps/app.html?parentOrigin=http://localhost:3000')"
   check "Thai cost-estimate path json.path_file (932370)" 200 "$(http -H 'Content-Type: application/json' -d '{"path_file":"a/Estimate&Control/b"}' http://localhost:8080/api/v2/activity)"
+  # PV-2026-10-33: " & Replace" trips 932235 once per matched field, so two fields = 10 (>7).
+  local amp='{"path_file":"MK/QT-260832 Clean Dust Line SAN1-24A401 & Replace Gasket SAN1-22R201_IRPC.xlsx","file_path_real":"MK/QT-260832 Clean Dust Line SAN1-24A401 & Replace Gasket SAN1-22R201_IRPC.xlsx"}'
+  check "filename 'A & Replace B' on listed fields (932235)" 200 "$(http -H 'Content-Type: application/json' -d "$amp" http://localhost:8080/api/v2/activity)"
+  check "  control: same text on unlisted fields is still blocked (932235 exclusion is field-scoped)" 403 "$(http -H 'Content-Type: application/json' -d '{"note_a":"x & Replace y","note_b":"x & Replace y"}' http://localhost:8080/api/v2/activity)"
   check "centrifugo data.array_1.file_path_real (932370)" 200 "$(http -H 'Content-Type: application/json' -d '{"data":[{"file_path_real":"x"},{"file_path_real":"a/Estimate&Control/b"}]}' http://localhost:8080/onebox-centrifugo/api/publish)"
   # Trips 942100 + 942160 (5+5): only 942100 is excluded on this field, so it
   # scores 5 (< threshold 7) here and 10 elsewhere -- proves the exclusion is scoped.
