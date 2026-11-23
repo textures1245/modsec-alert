@@ -85,7 +85,7 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-34"
+PATCH_VERSION="PV-2026-10-36"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
@@ -98,6 +98,8 @@ CHANGELOG=(
   "PV-2026-10-32  /business-drive/: 934190 (SSRF, scheme-less localhost) excluded as a whole rule, replacing the PV-2026-10-30 per-field list (ARGS:json.icons.array_N.src). The same manifest.json PUT was blocked again on json.start_url (score 10, ONEBOX-TRONEX-01, unique_id 17931716122.060266); a manifest has many URL fields (start_url, scope, id, shortcuts...). 934190 stays active on every other path."
   "PV-2026-10-33  RULES += 932235 (Unix command injection, command without evasion; sibling of 932230/932250 already excluded). POST /api/v2/activity blocked on ARGS:json.path_file, filename \"... Dust Line SAN1-24A401 & Replace Gasket ...xlsx\" (score 10, Onebox-Dedicate, unique_id 179324375291.259745). Global rather than endpoint-scoped: score 10 from one rule = likely a second field hit (same rule counted per matched ARGS), and the same rule blocked savefile_for_inbox (t_1792079201). No change to baseline or ENDPOINTS."
   "PV-2026-10-34  /business-drive/: 944110 (Java process spawn) + 944120 (Java serialization) excluded as whole rules. rclone PUT of a saved web page's jquery.js.download (raw file body, jQuery 1.11.3 contains 'runtime') scored 20 and was blocked, 3 retries (PUEANTAE-OneBox, 2026-11-13, unique_id 17945519305.317934 / 17945519787.521575 / 179455204310.569423). Raw file bodies are not a Java-deserialization vector. 944xxx stay active on every other path. Not changed: 920120 (apostrophe in multipart filename) and 920640 (no Content-Type on S3 PUT) on /business.box -- warnings only, no block seen."
+  "PV-2026-10-35  Java rules 944100 944110 944120 944130 944140 944150 944151 944152 excluded as whole rules on /business-drive/ (replaces the PV-2026-10-34 pair 944110/944120) and on /business.box (S3-style form POST and PUT, port 9000). The same false positive hit POST /business.box: a multipart upload of a text/JS file scored 20 on 944110+944120 and was blocked (PUEANTAE-OneBox, 2026-11-13, unique_id 17945530225.530379). These rules look for Java deserialization in the raw request body; on opaque file uploads any text containing 'runtime' or 'java.' trips them, so the whole family goes instead of one id per incident. 944xxx stay active on every other path."
+  "PV-2026-10-36  RULES += 941390 (JavaScript method detected; applies to every FIELDS entry). POST /api/v2/events blocked on ARGS:json.file_info.origin_filename \"Copy of Copy of FAB ACC IMPORT (Burberry SP19)_MAIL 06.11.18.xls\": text followed by an opening parenthesis reads as a JS call (Onebox-Dedicate, 2026-11-18, unique_id 179497628449.945185). ENDPOINTS += /documentserver/ with 942100 off ARGS:filename only: OnlyOffice viewer GET ?filename= with a Thai %uXXXX-encoded .xlsb name scored 10 on two libinjection hits (Onebox-Subsandee, 2026-11-23, unique_id 17954201719.900685). 942100 stays active on every other argument."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -209,6 +211,7 @@ RULES=(
   932120 932125 932230 932235 932250 932330 932340 932370 932380
   933100 933110 933120 933130 933140 933151 933160 933180
   941100 941101 941120
+  941390
   942100 942101 942140 942151 942190 942290
 )
 
@@ -239,12 +242,22 @@ for _r in 951100 951110 951120 951130 951140 951150 951160 951170 951180 951190 
           950100 950110 950120 950130 950140 950150 950160 950170 950180 950190; do
   DATALEAK_OFF+="${DATALEAK_OFF:+ }ruleRemoveById=$_r"
 done
+# Java deserialization rules (REQUEST-944, request body) off for raw file-upload
+# paths: file bodies are opaque and any text with 'runtime' / 'java.' trips them.
+JAVA_OFF=""
+for _r in 944100 944110 944120 944130 944140 944150 944151 944152; do
+  JAVA_OFF+="${JAVA_OFF:+ }ruleRemoveById=$_r"
+done
 ENDPOINTS=(
-  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME ruleRemoveById=920420 ruleRemoveById=930130 ruleRemoveById=934190 ruleRemoveById=944110 ruleRemoveById=944120"
+  "/business-drive/|ruleRemoveById=911100 ruleRemoveById=920340 ruleRemoveTargetById=932125;REQUEST_FILENAME ruleRemoveTargetById=932380;REQUEST_FILENAME ruleRemoveById=920420 ruleRemoveById=930130 ruleRemoveById=934190 $JAVA_OFF"
+  # S3-style object API on :9000 (form POST + PUT of uploaded files)
+  "/business.box|$JAVA_OFF"
   "/onebox_uploads/api/check_duplicate_inbox|ruleRemoveTargetById=942100;ARGS:json.header_info.Doc_remark1 ruleRemoveTargetById=942100;ARGS:json.header_info.BuyerLineTwo"
   # legacy 900210, scope FIXED (was REQUEST_URI @rx, matchable from any query
   # string). 949110 = blocking off for OnlyOffice itself -- FP follow-up open.
   "/onlyofficeds/|ruleRemoveById=934110 ruleRemoveById=949110"
+  # OnlyOffice DocumentServer viewer: ?filename= carries the (Thai, %uXXXX-encoded) file name
+  "/documentserver/|ruleRemoveTargetById=942100;ARGS:filename"
   "/document_editor/api/v1/get/only_office|ruleRemoveTargetById=930120;ARGS_NAMES"
   # legacy 900230 ^/(business-drive|downloads|extension_pdfjs|build|onlyofficeds), same prefixes
   "/business-drive|$DATALEAK_OFF"
