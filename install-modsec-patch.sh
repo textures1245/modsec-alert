@@ -85,7 +85,7 @@
 # Exit: 0 covered, 1 gaps, 2 audit could not run.
 set -euo pipefail
 
-PATCH_VERSION="PV-2026-10-36"
+PATCH_VERSION="PV-2026-10-37"
 
 CHANGELOG=(
   "PV-2026-10-13  First script-managed version. Global field list = tracker canonical (2026-08-17) + 932125/932380/932370/942140. /business-drive/: 911100+920340 whole-rule (tracker id 1000010, minus 920640: not canonical per Document) + 932125/932380 off REQUEST_FILENAME. check_duplicate_inbox 942100 fields (POST-method chain dropped)."
@@ -100,6 +100,7 @@ CHANGELOG=(
   "PV-2026-10-34  /business-drive/: 944110 (Java process spawn) + 944120 (Java serialization) excluded as whole rules. rclone PUT of a saved web page's jquery.js.download (raw file body, jQuery 1.11.3 contains 'runtime') scored 20 and was blocked, 3 retries (PUEANTAE-OneBox, 2026-11-13, unique_id 17945519305.317934 / 17945519787.521575 / 179455204310.569423). Raw file bodies are not a Java-deserialization vector. 944xxx stay active on every other path. Not changed: 920120 (apostrophe in multipart filename) and 920640 (no Content-Type on S3 PUT) on /business.box -- warnings only, no block seen."
   "PV-2026-10-35  Java rules 944100 944110 944120 944130 944140 944150 944151 944152 excluded as whole rules on /business-drive/ (replaces the PV-2026-10-34 pair 944110/944120) and on /business.box (S3-style form POST and PUT, port 9000). The same false positive hit POST /business.box: a multipart upload of a text/JS file scored 20 on 944110+944120 and was blocked (PUEANTAE-OneBox, 2026-11-13, unique_id 17945530225.530379). These rules look for Java deserialization in the raw request body; on opaque file uploads any text containing 'runtime' or 'java.' trips them, so the whole family goes instead of one id per incident. 944xxx stay active on every other path."
   "PV-2026-10-36  RULES += 941390 (JavaScript method detected; applies to every FIELDS entry). POST /api/v2/events blocked on ARGS:json.file_info.origin_filename \"Copy of Copy of FAB ACC IMPORT (Burberry SP19)_MAIL 06.11.18.xls\": text followed by an opening parenthesis reads as a JS call (Onebox-Dedicate, 2026-11-18, unique_id 179497628449.945185). ENDPOINTS += /documentserver/ with 942100 off ARGS:filename only: OnlyOffice viewer GET ?filename= with a Thai %uXXXX-encoded .xlsb name scored 10 on two libinjection hits (Onebox-Subsandee, 2026-11-23, unique_id 17954201719.900685). 942100 stays active on every other argument."
+  "PV-2026-10-37  RULES += 930120 (OS file access); FIELDS += json.fullpath. POST /api/v2/activity blocked on ARGS:json.err_message, an rclone debug line containing the folder name 'program files x86' (score 10, EXPERIMENTAL-PM-01, 2026-11-24, unique_id 179550257344.973667); json.err_message was already in FIELDS, only the rule was missing. POST /external/api/v1/get_data_by_fullpath blocked on ARGS:json.fullpath 'SVP-Cross-Department/Production&QC/2026/DATABASE (<Thai>)': folder named DATABASE tripped 942140 + 942151 + 942190 (score 15, Onebox-Dedicate, 2026-11-24, unique_id 179548628349.758132 / 179548634623.504290); the rules were already global, the field was not. 930120 and the 942xxx ids stay active on every other argument."
 )
 
 # Engine settings enforced on every box, emitted into before-crs.conf so they
@@ -208,6 +209,7 @@ NOTE_MARK="#[onebox-patch note] "
 RULES=(
   200002
   920230 920240 920270 920271 920272 920273
+  930120
   932120 932125 932230 932235 932250 932330 932340 932370 932380
   933100 933110 933120 933130 933140 933151 933160 933180
   941100 941101 941120
@@ -222,7 +224,7 @@ FIELDS=(
   json.data.data json.file_path_real json.file_path_temp json.path_file
   json.file_info.full_path json.file_info.display_full_path
   json.file_info.filename json.file_info.origin_filename
-  json.destination_path json.err_message
+  json.destination_path json.err_message json.fullpath
   # centrifugo publish: libmodsecurity names JSON array items by position, so
   # every index must be listed. Extend if a payload ever carries >10 files.
   json.data.array_0.file_path_real json.data.array_1.file_path_real
